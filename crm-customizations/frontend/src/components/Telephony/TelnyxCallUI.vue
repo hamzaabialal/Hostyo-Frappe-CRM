@@ -18,7 +18,23 @@
       <div class="telnyx-dock__number">{{ displayNumber }}</div>
     </div>
 
-    <div class="telnyx-dock__body">
+    <div v-if="status === 'ringing'" class="telnyx-dock__body">
+      <button class="telnyx-dock__btn telnyx-dock__btn--answer" @click="answerCall">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z" />
+        </svg>
+        <span>Answer</span>
+      </button>
+
+      <button class="telnyx-dock__btn telnyx-dock__btn--hangup" @click="declineCall">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+          <path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1a1 1 0 0 1-.7.95c-.98.32-1.87.77-2.67 1.32a1 1 0 0 1-1.41-.13l-2.35-2.9a1 1 0 0 1 .15-1.4C3.85 8.4 7.72 7 12 7s8.15 1.4 11.58 3.66a1 1 0 0 1 .15 1.4l-2.35 2.9a1 1 0 0 1-1.41.13c-.8-.55-1.7-1-2.67-1.32a1 1 0 0 1-.7-.95v-3.1A15.6 15.6 0 0 0 12 9z" />
+        </svg>
+        <span>Decline</span>
+      </button>
+    </div>
+
+    <div v-else class="telnyx-dock__body">
       <button
         class="telnyx-dock__btn"
         :class="{ active: isMuted }"
@@ -69,7 +85,8 @@ import { globalStore } from '@/stores/global'
 import { TelnyxRTC } from '@telnyx/webrtc'
 
 const session = inject('session')
-const { $socket } = globalStore()
+const gStore = globalStore()
+const { $socket } = gStore
 
 const client = ref(null)
 const remoteAudioEl = ref(null)
@@ -80,8 +97,19 @@ const isHeld = ref(false)
 const status = ref('idle')
 const leadNumber = ref('')
 const leadName = ref('')
+const callDirection = ref('')
 const durationSeconds = ref(0)
 let timerHandle = null
+
+// Telnyx echoes back whatever custom_headers we set when originating the SIP
+// leg (see telnyx.py: X-Call-Direction is "outbound" for click-to-call agent
+// legs, "inbound" for ring-group legs). The WebRTC SDK surfaces them on the
+// call's `options.custom_headers`.
+function getCallDirection(call) {
+  const headers = call?.options?.custom_headers || []
+  const entry = headers.find((h) => (h.name || '').toLowerCase() === 'x-call-direction')
+  return (entry?.value || '').toLowerCase()
+}
 
 const statusLabel = computed(() => {
   return {
@@ -152,8 +180,24 @@ async function setupClient() {
     if (call.state === 'ringing') {
       activeCall.value = call
       visible.value = true
-      status.value = 'connecting'
-      call.answer()
+      callDirection.value = getCallDirection(call)
+
+      if (callDirection.value === 'inbound') {
+        // A real inbound call - show Answer/Decline and wait for the agent.
+        status.value = 'ringing'
+        leadNumber.value = call.options?.remoteCallerNumber || ''
+        leadName.value = call.options?.remoteCallerName || ''
+      } else {
+        // Outbound click-to-call: this is our own softphone leg ringing back
+        // to us, so auto-answer it exactly like before.
+        status.value = 'connecting'
+        if (gStore.pendingCall) {
+          leadNumber.value = gStore.pendingCall.number || ''
+          leadName.value = gStore.pendingCall.lead_name || ''
+          gStore.pendingCall = null
+        }
+        call.answer()
+      }
     } else if (call.state === 'active') {
       status.value = 'active'
       startTimer()
@@ -172,6 +216,7 @@ async function setupClient() {
         status.value = 'idle'
         leadNumber.value = ''
         leadName.value = ''
+        callDirection.value = ''
       }, 1500)
     }
   })
@@ -204,6 +249,17 @@ function hangup() {
   activeCall.value.hangup()
 }
 
+function answerCall() {
+  if (!activeCall.value) return
+  activeCall.value.answer()
+  status.value = 'connecting'
+}
+
+function declineCall() {
+  if (!activeCall.value) return
+  activeCall.value.hangup()
+}
+
 function onTelnyxCallEvent(data) {
   console.log('TELNYX EVENT RECEIVED:', data)
   if (!data) return
@@ -221,6 +277,8 @@ function onTelnyxCallEvent(data) {
       visible.value = false
       status.value = 'idle'
       leadNumber.value = ''
+      leadName.value = ''
+      callDirection.value = ''
     }, 1500)
   }
 }
@@ -364,6 +422,14 @@ onBeforeUnmount(() => {
 }
 .telnyx-dock__btn--hangup:hover:not(:disabled) {
   background: #b91c1c;
+}
+.telnyx-dock__btn--answer {
+  background: #22c55e;
+  color: #fff;
+  border-color: #22c55e;
+}
+.telnyx-dock__btn--answer:hover:not(:disabled) {
+  background: #16a34a;
 }
 .telnyx-dock__btn:disabled {
   opacity: 0.4;

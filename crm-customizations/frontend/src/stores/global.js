@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { getCurrentInstance } from 'vue'
+import { getCurrentInstance, ref } from 'vue'
 import { call, toast } from 'frappe-ui'
 
 export const globalStore = defineStore('crm-global', () => {
@@ -7,6 +7,9 @@ export const globalStore = defineStore('crm-global', () => {
   const { $dialog, $socket } = app.appContext.config.globalProperties
 
   let callMethod = () => {}
+  // Set the moment a call is placed so the Telnyx call popup can show the
+  // lead's name right away, instead of waiting on the webhook/socket round-trip.
+  const pendingCall = ref(null)
 
   function setMakeCall(value) {
     callMethod = value
@@ -57,7 +60,11 @@ export const globalStore = defineStore('crm-global', () => {
       reference_doctype: ref.doctype || '',
       reference_name: ref.name || '',
     })
-      .then(() => {
+      .then((res) => {
+        pendingCall.value = {
+          number,
+          lead_name: res?.lead_name || '',
+        }
         toast.success('Calling ' + number + ' - answer your softphone')
       })
       .catch((e) => {
@@ -70,5 +77,6 @@ export const globalStore = defineStore('crm-global', () => {
     $socket,
     makeCall,
     setMakeCall,
+    pendingCall,
   }
 })
