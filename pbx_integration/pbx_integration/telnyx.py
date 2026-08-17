@@ -104,26 +104,42 @@ def _find_caller_reference(caller_number):
     """
     normalized_caller = _normalize_phone(caller_number)
     if not normalized_caller:
+        frappe.log_error(
+            "Telnyx Caller Lookup",
+            f"caller_number={caller_number!r} normalized to empty - nothing to search",
+        )
         return None, None
 
-    leads = frappe.get_all(
-        "CRM Lead",
-        or_filters=[["mobile_no", "is", "set"], ["phone", "is", "set"]],
-        fields=["name", "mobile_no", "phone"],
-    )
+    # Deliberately unfiltered (no or_filters "is set" trick) - fetch every
+    # lead and compare in Python so there's no ambiguity about whether a
+    # server-side filter is silently excluding rows.
+    leads = frappe.get_all("CRM Lead", fields=["name", "mobile_no", "phone"])
     for lead in leads:
         if normalized_caller in (_normalize_phone(lead.mobile_no), _normalize_phone(lead.phone)):
+            # TEMPORARY DEBUG LOGGING - remove once inbound caller-name resolution is confirmed working
+            frappe.log_error(
+                "Telnyx Caller Lookup",
+                f"MATCH caller={caller_number!r} normalized={normalized_caller!r} -> "
+                f"CRM Lead {lead.name} (mobile_no={lead.mobile_no!r}, phone={lead.phone!r})",
+            )
             return "CRM Lead", lead.name
 
-    contact_phones = frappe.get_all(
-        "Contact Phone",
-        filters={"phone": ["is", "set"]},
-        fields=["phone", "parent"],
-    )
+    contact_phones = frappe.get_all("Contact Phone", fields=["phone", "parent"])
     for row in contact_phones:
         if normalized_caller == _normalize_phone(row.phone):
+            frappe.log_error(
+                "Telnyx Caller Lookup",
+                f"MATCH caller={caller_number!r} normalized={normalized_caller!r} -> Contact {row.parent}",
+            )
             return "Contact", row.parent
 
+    # TEMPORARY DEBUG LOGGING - remove once inbound caller-name resolution is confirmed working
+    frappe.log_error(
+        "Telnyx Caller Lookup",
+        f"NO MATCH caller={caller_number!r} normalized={normalized_caller!r} - "
+        f"checked {len(leads)} leads, {len(contact_phones)} contact phones. "
+        f"Lead numbers on file: {[(l.name, l.mobile_no, l.phone) for l in leads][:20]}",
+    )
     return None, None
 
 
@@ -248,8 +264,20 @@ def handle_telnyx_webhook():
         frappe.log_error("Telnyx Webhook CRASH", frappe.get_traceback())
 
     if call_log_name and state.get("agent_user"):
-        to_number = frappe.db.get_value("CRM Call Log", call_log_name, "to")
-        lead_name = _lead_display_name(call_log_name)
+        to_number, ref_doctype, ref_name = frappe.db.get_value(
+            "CRM Call Log", call_log_name, ["to", "reference_doctype", "reference_docname"]
+        )
+        lead_name = _display_name_for_reference(ref_doctype, ref_name)
+        # TEMPORARY DEBUG LOGGING - remove once inbound caller-name resolution is confirmed working.
+        # This block fires for BOTH the ring-time event (call.initiated on a
+        # ring_group agent leg, published to that one agent as soon as their
+        # leg starts ringing) and the later call.answered/call.hangup events -
+        # event_type below tells you which.
+        frappe.log_error(
+            "Telnyx Realtime Publish",
+            f"event={event_type} leg={leg} call_log={call_log_name} agent_user={state.get('agent_user')} "
+            f"to={to_number} reference={ref_doctype}/{ref_name} lead_name={lead_name!r}",
+        )
         frappe.publish_realtime(
             "telnyx_call_event",
             {
@@ -517,11 +545,3 @@ def _display_name_for_reference(reference_doctype, reference_name):
     except Exception:
         pass
     return None
-
-
-def _lead_display_name(call_log_name):
-    """Look up the linked Lead/Deal/Contact's display name for a call log."""
-    ref_doctype, ref_name = frappe.db.get_value(
-        "CRM Call Log", call_log_name, ["reference_doctype", "reference_docname"]
-    )
-    return _display_name_for_reference(ref_doctype, ref_name)
