@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 
 import frappe
 import requests
@@ -85,6 +86,45 @@ def _agent_sip_username(user):
 
 def _ring_group_cache_key(customer_call_id):
     return f"telnyx_ring_group:{customer_call_id}"
+
+
+def _normalize_phone(number):
+    """Strip everything but digits so differently-formatted numbers compare
+    equal (+357 9776 1711 / +35797761711 / 35797761711 / 00357-9776-1711 all
+    normalize to the same digit string).
+    """
+    return re.sub(r"\D", "", number or "")
+
+
+def _find_caller_reference(caller_number):
+    """Best-effort reverse lookup: does this caller's number match an
+    existing CRM Lead or Contact? Both sides are normalized before comparing
+    since Telnyx's caller ID format rarely matches how the number happens to
+    be stored.
+    """
+    normalized_caller = _normalize_phone(caller_number)
+    if not normalized_caller:
+        return None, None
+
+    leads = frappe.get_all(
+        "CRM Lead",
+        or_filters=[["mobile_no", "is", "set"], ["phone", "is", "set"]],
+        fields=["name", "mobile_no", "phone"],
+    )
+    for lead in leads:
+        if normalized_caller in (_normalize_phone(lead.mobile_no), _normalize_phone(lead.phone)):
+            return "CRM Lead", lead.name
+
+    contact_phones = frappe.get_all(
+        "Contact Phone",
+        filters={"phone": ["is", "set"]},
+        fields=["phone", "parent"],
+    )
+    for row in contact_phones:
+        if normalized_caller == _normalize_phone(row.phone):
+            return "Contact", row.parent
+
+    return None, None
 
 
 @frappe.whitelist()
@@ -281,6 +321,7 @@ def _start_ring_group(call_control_id, payload):
     """
     customer_number = payload.get("from")
     our_number = payload.get("to")
+    reference_doctype, reference_name = _find_caller_reference(customer_number)
 
     call_log = frappe.get_doc(
         {
@@ -294,6 +335,10 @@ def _start_ring_group(call_control_id, payload):
             "start_time": frappe.utils.now_datetime(),
         }
     )
+    if reference_doctype and reference_name:
+        call_log.reference_doctype = reference_doctype
+        call_log.reference_docname = reference_name
+
     call_log.insert(ignore_permissions=True)
 
     agents = frappe.get_all(

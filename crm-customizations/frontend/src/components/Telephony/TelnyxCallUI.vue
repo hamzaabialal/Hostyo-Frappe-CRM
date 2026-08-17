@@ -103,10 +103,14 @@ let timerHandle = null
 
 // Telnyx echoes back whatever custom_headers we set when originating the SIP
 // leg (see telnyx.py: X-Call-Direction is "outbound" for click-to-call agent
-// legs, "inbound" for ring-group legs). The WebRTC SDK surfaces them on the
-// call's `options.custom_headers`.
+// legs, "inbound" for ring-group legs). Confirmed against the @telnyx/webrtc
+// source (VertoHandler.ts): the wire-format `dialogParams.custom_headers`
+// (snake_case) gets parsed into `callOptions.customHeaders` (camelCase),
+// which ends up as the call's public `options.customHeaders` - NOT
+// `options.custom_headers`, which was the earlier (wrong) guess that made
+// every inbound call fall through to auto-answer.
 function getCallDirection(call) {
-  const headers = call?.options?.custom_headers || []
+  const headers = call?.options?.customHeaders || []
   const entry = headers.find((h) => (h.name || '').toLowerCase() === 'x-call-direction')
   return (entry?.value || '').toLowerCase()
 }
@@ -180,6 +184,9 @@ async function setupClient() {
     if (call.state === 'ringing') {
       activeCall.value = call
       visible.value = true
+      // TEMPORARY DEBUG LOGGING - remove once the customHeaders shape above
+      // is confirmed against a real inbound call.
+      console.log('TELNYX RINGING call.options:', JSON.stringify(call.options))
       callDirection.value = getCallDirection(call)
 
       if (callDirection.value === 'inbound') {
