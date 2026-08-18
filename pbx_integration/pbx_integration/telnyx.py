@@ -260,6 +260,9 @@ def handle_telnyx_webhook():
         elif event_type == "call.hangup" and ring_group:
             _ring_group_customer_hangup(call_control_id, ring_group)
 
+        elif event_type == "call.hangup" and leg == "B":
+            _lead_hangup(call_control_id, state, call_log_name)
+
         elif event_type == "call.hangup":
             _call_ended(call_control_id, leg, state, call_log_name)
 
@@ -269,8 +272,8 @@ def handle_telnyx_webhook():
         frappe.log_error("Telnyx Webhook CRASH", frappe.get_traceback())
 
     if call_log_name and state.get("agent_user"):
-        to_number, ref_doctype, ref_name = frappe.db.get_value(
-            "CRM Call Log", call_log_name, ["to", "reference_doctype", "reference_docname"]
+        to_number, call_status, ref_doctype, ref_name = frappe.db.get_value(
+            "CRM Call Log", call_log_name, ["to", "status", "reference_doctype", "reference_docname"]
         )
         lead_name = _display_name_for_reference(ref_doctype, ref_name)
         # TEMPORARY DEBUG LOGGING - remove once inbound caller-name resolution is confirmed working.
@@ -281,7 +284,7 @@ def handle_telnyx_webhook():
         frappe.log_error(
             "Telnyx Realtime Publish",
             f"event={event_type} leg={leg} call_log={call_log_name} agent_user={state.get('agent_user')} "
-            f"to={to_number} reference={ref_doctype}/{ref_name} lead_name={lead_name!r}",
+            f"to={to_number} status={call_status} reference={ref_doctype}/{ref_name} lead_name={lead_name!r}",
         )
         frappe.publish_realtime(
             "telnyx_call_event",
@@ -291,6 +294,7 @@ def handle_telnyx_webhook():
                 "call_log": call_log_name,
                 "call_control_id": call_control_id,
                 "to": to_number,
+                "status": call_status,
                 "lead_name": lead_name,
                 "reference_doctype": ref_doctype,
                 "reference_docname": ref_name,
@@ -299,6 +303,10 @@ def handle_telnyx_webhook():
         )
 
     return {"success": True}
+
+
+def _leg_b_pending_cache_key(leg_b_id):
+    return f"telnyx_leg_b_pending:{leg_b_id}"
 
 
 def _agent_answered(leg_a_id, state, call_log_name):
@@ -318,15 +326,24 @@ def _agent_answered(leg_a_id, state, call_log_name):
         }
     )
 
-    _post(
+    data = _post(
         "/calls",
         {
             "connection_id": _connection_id(),
             "to": destination,
             "from": _caller_id(),
             "client_state": leg_b_state,
+            "timeout_secs": RING_TIMEOUT_SECS,
         },
     )
+
+    # Marks leg B as "ringing, not yet answered" - deleted the moment it's
+    # answered (_lead_answered). Still present at leg B's own hangup means
+    # the lead never picked up, distinct from a normal call that connected
+    # and later ended (see _lead_hangup).
+    leg_b_id = data.get("data", {}).get("call_control_id")
+    if leg_b_id:
+        frappe.cache().set_value(_leg_b_pending_cache_key(leg_b_id), 1, expires_in_sec=RING_GROUP_CACHE_TTL)
 
 
 def _lead_answered(leg_b_id, state, call_log_name):
@@ -334,6 +351,8 @@ def _lead_answered(leg_b_id, state, call_log_name):
     if not leg_a_id:
         frappe.log_error(f"Telnyx: leg B answered but no leg_a_id in state: {state}", "Telnyx Webhook")
         return
+
+    frappe.cache().delete_value(_leg_b_pending_cache_key(leg_b_id))
 
     _post(f"/calls/{leg_a_id}/actions/bridge", {"call_control_id": leg_b_id})
     _start_recording(leg_a_id, call_log_name)
@@ -343,8 +362,38 @@ def _lead_answered(leg_b_id, state, call_log_name):
         frappe.db.commit()
 
 
+def _lead_hangup(leg_b_id, state, call_log_name):
+    """Leg B (the lead's phone) hung up. If it was never answered (still
+    marked pending), this is a genuine "No Answer" - timeout, busy, or
+    declined - not a normal call end, so it's marked distinctly and the
+    agent's now-orphaned leg A (nothing left to bridge it to) is hung up too.
+    """
+    cache_key = _leg_b_pending_cache_key(leg_b_id)
+    was_pending = frappe.cache().get_value(cache_key)
+    frappe.cache().delete_value(cache_key)
+
+    if not was_pending:
+        _call_ended(leg_b_id, "B", state, call_log_name)
+        return
+
+    leg_a_id = state.get("leg_a_id")
+    if leg_a_id:
+        _post(f"/calls/{leg_a_id}/actions/hangup", {})
+
+    if call_log_name:
+        frappe.db.set_value("CRM Call Log", call_log_name, "status", "No Answer")
+        frappe.db.set_value("CRM Call Log", call_log_name, "end_time", frappe.utils.now_datetime())
+        frappe.db.commit()
+
+
 def _call_ended(call_control_id, leg, state, call_log_name):
     if call_log_name:
+        # Don't downgrade a more specific terminal status (e.g. the "No
+        # Answer" _lead_hangup just set) back to a generic "Completed" -
+        # this fires again when the leg-A hangup that _lead_hangup triggers
+        # comes back through as its own webhook event.
+        if frappe.db.get_value("CRM Call Log", call_log_name, "status") == "No Answer":
+            return
         frappe.db.set_value("CRM Call Log", call_log_name, "status", "Completed")
         frappe.db.set_value("CRM Call Log", call_log_name, "end_time", frappe.utils.now_datetime())
         frappe.db.commit()

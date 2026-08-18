@@ -146,14 +146,17 @@ const statusLabel = computed(() => {
     idle: 'Idle',
     ringing: 'Incoming...',
     connecting: 'Connecting...',
+    dialing: 'Calling...',
     active: 'On Call',
     ended: 'Call Ended',
+    no_answer: 'No Answer',
   }[status.value]
 })
 
 const statusClass = computed(() => ({
   'telnyx-dock__dot--live': status.value === 'active',
-  'telnyx-dock__dot--ringing': status.value === 'ringing' || status.value === 'connecting',
+  'telnyx-dock__dot--ringing':
+    status.value === 'ringing' || status.value === 'connecting' || status.value === 'dialing',
 }))
 
 const displayNumber = computed(() => leadName.value || leadNumber.value || 'Unknown number')
@@ -224,6 +227,35 @@ function stopRingtone() {
   }
 }
 
+// Shared teardown for both end-of-call signals: the WebRTC client's own
+// hangup/destroy notification, and the telnyx_call_event socket message.
+// They aren't guaranteed to arrive in a particular order, so a more specific
+// reason ("no_answer") is never downgraded back to a generic "ended" by
+// whichever signal happens to land second.
+function endCall(reason) {
+  if (status.value === reason) return // already handled - e.g. both legs' hangups reporting the same outcome
+  if (status.value === 'no_answer' && reason !== 'no_answer') return
+
+  status.value = reason
+  activeCall.value = null
+  isMuted.value = false
+  isHeld.value = false
+  stopTimer()
+  stopRingtone()
+
+  // Give the agent a moment longer to actually read "No Answer" before the
+  // dock disappears, versus the brief flash for a normal call ending.
+  const delay = reason === 'no_answer' ? 2500 : 1500
+  setTimeout(() => {
+    visible.value = false
+    status.value = 'idle'
+    leadNumber.value = ''
+    leadName.value = ''
+    callDirection.value = ''
+    leadReference.value = null
+  }, delay)
+}
+
 async function setupClient() {
   let creds
   try {
@@ -281,28 +313,24 @@ async function setupClient() {
         call.answer()
       }
     } else if (call.state === 'active') {
-      status.value = 'active'
       stopRingtone()
-      startTimer()
       if (remoteAudioEl.value && call.remoteStream) {
         remoteAudioEl.value.srcObject = call.remoteStream
         remoteAudioEl.value.play().catch((e) => console.error('Telnyx: audio play failed', e))
       }
+
+      if (callDirection.value === 'outbound') {
+        // Our own leg just connected - Telnyx now dials the lead (leg B)
+        // server-side. Stay off 'active'/the timer, and play the ringtone,
+        // until leg B actually answers (telnyx_call_event, handled below).
+        status.value = 'dialing'
+        playRingtone()
+      } else {
+        status.value = 'active'
+        startTimer()
+      }
     } else if (call.state === 'hangup' || call.state === 'destroy') {
-      status.value = 'ended'
-      activeCall.value = null
-      isMuted.value = false
-      isHeld.value = false
-      stopTimer()
-      stopRingtone()
-      setTimeout(() => {
-        visible.value = false
-        status.value = 'idle'
-        leadNumber.value = ''
-        leadName.value = ''
-        callDirection.value = ''
-        leadReference.value = null
-      }, 1500)
+      endCall('ended')
     }
   })
 
@@ -360,18 +388,14 @@ function onTelnyxCallEvent(data) {
   if (data.reference_doctype && data.reference_docname) {
     setReference(data.reference_doctype, data.reference_docname)
   }
-  if (data.event === 'call.hangup') {
-    status.value = 'ended'
-    stopTimer()
+  if (data.event === 'call.answered' && data.leg === 'B') {
+    // The lead just picked up - this is the real start of the conversation.
     stopRingtone()
-    setTimeout(() => {
-      visible.value = false
-      status.value = 'idle'
-      leadNumber.value = ''
-      leadName.value = ''
-      callDirection.value = ''
-      leadReference.value = null
-    }, 1500)
+    status.value = 'active'
+    startTimer()
+  }
+  if (data.event === 'call.hangup') {
+    endCall(data.status === 'No Answer' ? 'no_answer' : 'ended')
   }
 }
 

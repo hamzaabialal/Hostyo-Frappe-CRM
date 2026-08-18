@@ -41,7 +41,14 @@
 
 ## Outbound calling
 
-Agent clicks "Make a Call" → `create_click2call` dials the agent's own SIP softphone (leg A, tagged `X-Call-Direction: outbound`), then once the agent answers, dials the lead's number (leg B) and bridges the two. The agent's WebRTC client auto-answers leg A instantly (it's just their own softphone ringing back to them), so the call UI goes straight to "Connecting..." then "On Call". Once bridged, `_start_recording` starts a dual-channel recording on leg A.
+Agent clicks "Make a Call" → `create_click2call` dials the agent's own SIP softphone (leg A, tagged `X-Call-Direction: outbound`). The WebRTC client auto-answers leg A instantly (it's just their own softphone ringing back to them), so the call UI goes straight to "Connecting...". Once leg A is truly connected, `_agent_answered` dials the lead's number (leg B, `timeout_secs=RING_TIMEOUT_SECS`) — the frontend shows "Calling..." with the ringtone playing (same generated tone as inbound) while leg B rings, since leg A connecting is not the same as the lead picking up.
+
+- **Lead answers**: `_lead_answered` clears leg B's pending marker, bridges the two legs, and starts recording. The `telnyx_call_event` for leg B's `call.answered` is what actually flips the frontend to "On Call" and starts the timer (the WebRTC client's own `active` event only tells us leg A connected, not that the lead did).
+- **Lead doesn't answer** (times out, busy, or declined): `_lead_hangup` checks whether leg B was ever marked answered (`telnyx_leg_b_pending:<leg_b_id>` in `frappe.cache()`, set when leg B is dialed and cleared the moment it's answered — still present at hangup means it never was). If so, it hangs up the now-orphaned leg A and marks the `CRM Call Log` status `No Answer` instead of letting it fall through to a generic `Completed` — `_call_ended` won't downgrade that back to `Completed` when leg A's own hangup webhook follows moments later. The frontend shows a distinct "No Answer" state (from the `status` field now included in the `telnyx_call_event` payload) for a couple of seconds before the dock closes.
+
+Once bridged, `_start_recording` starts a dual-channel recording on leg A.
+
+Known gap: if the agent hangs up leg A themselves while leg B is still ringing, leg B currently keeps ringing the lead's phone independently — there's no cancel-the-other-leg wiring for that direction (only for "leg B failed → hang up leg A"). Not hit by normal use, but worth knowing.
 
 ## Inbound calling
 
