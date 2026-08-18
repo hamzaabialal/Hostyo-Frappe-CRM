@@ -15,7 +15,11 @@
           <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z" />
         </svg>
       </div>
-      <div class="telnyx-dock__number">{{ displayNumber }}</div>
+      <div
+        class="telnyx-dock__number"
+        :class="{ 'telnyx-dock__number--link': leadReference }"
+        @click="goToReference"
+      >{{ displayNumber }}</div>
     </div>
 
     <div v-if="status === 'ringing'" class="telnyx-dock__body">
@@ -80,6 +84,7 @@
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount, computed, inject } from 'vue'
+import { useRouter } from 'vue-router'
 import { call as frappeCall } from 'frappe-ui'
 import { globalStore } from '@/stores/global'
 import { TelnyxRTC } from '@telnyx/webrtc'
@@ -87,6 +92,7 @@ import { TelnyxRTC } from '@telnyx/webrtc'
 const session = inject('session')
 const gStore = globalStore()
 const { $socket } = gStore
+const router = useRouter()
 
 const client = ref(null)
 const remoteAudioEl = ref(null)
@@ -97,9 +103,29 @@ const isHeld = ref(false)
 const status = ref('idle')
 const leadNumber = ref('')
 const leadName = ref('')
+const leadReference = ref(null) // { doctype, name } once a Lead/Deal/Contact is resolved
 const callDirection = ref('')
 const durationSeconds = ref(0)
 let timerHandle = null
+
+// Route name + param key for each doctype the name/number can link to.
+const REFERENCE_ROUTES = {
+  'CRM Lead': { name: 'Lead', param: 'leadId' },
+  'CRM Deal': { name: 'Deal', param: 'dealId' },
+  Contact: { name: 'Contact', param: 'contactId' },
+}
+
+function setReference(doctype, name) {
+  const route = doctype && name && REFERENCE_ROUTES[doctype]
+  leadReference.value = route ? { doctype, name } : null
+}
+
+function goToReference() {
+  const ref = leadReference.value
+  const route = ref && REFERENCE_ROUTES[ref.doctype]
+  if (!route) return
+  router.push({ name: route.name, params: { [route.param]: ref.name } })
+}
 
 // Telnyx echoes back whatever custom_headers we set when originating the SIP
 // leg (see telnyx.py: X-Call-Direction is "outbound" for click-to-call agent
@@ -153,6 +179,51 @@ function stopTimer() {
   }
 }
 
+// Generated tone (no external audio file, so nothing to license) - a classic
+// two-beep ring cadence, repeating every 2s while an inbound call is ringing.
+let ringtoneCtx = null
+let ringtoneHandle = null
+
+function playRingtone() {
+  stopRingtone()
+  const AudioCtx = window.AudioContext || window.webkitAudioContext
+  if (!AudioCtx) return
+  ringtoneCtx = new AudioCtx()
+  ringtoneCtx.resume?.().catch(() => {})
+
+  const ringOnce = () => {
+    if (!ringtoneCtx) return
+    const now = ringtoneCtx.currentTime
+    ;[0, 0.4].forEach((offset) => {
+      const osc = ringtoneCtx.createOscillator()
+      const gain = ringtoneCtx.createGain()
+      osc.frequency.value = 440
+      gain.gain.setValueAtTime(0, now + offset)
+      gain.gain.linearRampToValueAtTime(0.15, now + offset + 0.02)
+      gain.gain.setValueAtTime(0.15, now + offset + 0.35)
+      gain.gain.linearRampToValueAtTime(0, now + offset + 0.4)
+      osc.connect(gain)
+      gain.connect(ringtoneCtx.destination)
+      osc.start(now + offset)
+      osc.stop(now + offset + 0.4)
+    })
+  }
+
+  ringOnce()
+  ringtoneHandle = setInterval(ringOnce, 2000)
+}
+
+function stopRingtone() {
+  if (ringtoneHandle) {
+    clearInterval(ringtoneHandle)
+    ringtoneHandle = null
+  }
+  if (ringtoneCtx) {
+    ringtoneCtx.close().catch(() => {})
+    ringtoneCtx = null
+  }
+}
+
 async function setupClient() {
   let creds
   try {
@@ -194,19 +265,24 @@ async function setupClient() {
         status.value = 'ringing'
         leadNumber.value = call.options?.remoteCallerNumber || ''
         leadName.value = call.options?.remoteCallerName || ''
+        setReference(null, null) // filled in by the telnyx_call_event socket update, if it matches a lead
+        playRingtone()
       } else {
         // Outbound click-to-call: this is our own softphone leg ringing back
-        // to us, so auto-answer it exactly like before.
+        // to us, so auto-answer it exactly like before. It connects almost
+        // instantly, so a ringtone here would just be a jarring blip - skip it.
         status.value = 'connecting'
         if (gStore.pendingCall) {
           leadNumber.value = gStore.pendingCall.number || ''
           leadName.value = gStore.pendingCall.lead_name || ''
+          setReference(gStore.pendingCall.reference_doctype, gStore.pendingCall.reference_docname)
           gStore.pendingCall = null
         }
         call.answer()
       }
     } else if (call.state === 'active') {
       status.value = 'active'
+      stopRingtone()
       startTimer()
       if (remoteAudioEl.value && call.remoteStream) {
         remoteAudioEl.value.srcObject = call.remoteStream
@@ -218,12 +294,14 @@ async function setupClient() {
       isMuted.value = false
       isHeld.value = false
       stopTimer()
+      stopRingtone()
       setTimeout(() => {
         visible.value = false
         status.value = 'idle'
         leadNumber.value = ''
         leadName.value = ''
         callDirection.value = ''
+        leadReference.value = null
       }, 1500)
     }
   })
@@ -258,12 +336,14 @@ function hangup() {
 
 function answerCall() {
   if (!activeCall.value) return
+  stopRingtone()
   activeCall.value.answer()
   status.value = 'connecting'
 }
 
 function declineCall() {
   if (!activeCall.value) return
+  stopRingtone()
   activeCall.value.hangup()
 }
 
@@ -277,15 +357,20 @@ function onTelnyxCallEvent(data) {
   if (data.lead_name) {
     leadName.value = data.lead_name
   }
+  if (data.reference_doctype && data.reference_docname) {
+    setReference(data.reference_doctype, data.reference_docname)
+  }
   if (data.event === 'call.hangup') {
     status.value = 'ended'
     stopTimer()
+    stopRingtone()
     setTimeout(() => {
       visible.value = false
       status.value = 'idle'
       leadNumber.value = ''
       leadName.value = ''
       callDirection.value = ''
+      leadReference.value = null
     }, 1500)
   }
 }
@@ -305,6 +390,7 @@ onBeforeUnmount(() => {
   }
   $socket.off('telnyx_call_event', onTelnyxCallEvent)
   stopTimer()
+  stopRingtone()
 })
 </script>
 
@@ -391,6 +477,12 @@ onBeforeUnmount(() => {
   font-size: 17px;
   font-weight: 600;
   color: #171717;
+}
+.telnyx-dock__number--link {
+  cursor: pointer;
+  color: #2563eb;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .telnyx-dock__body {

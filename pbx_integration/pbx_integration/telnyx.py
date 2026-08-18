@@ -198,6 +198,8 @@ def create_click2call(to, reference_doctype=None, reference_name=None):
         "call_control_id": call_control_id,
         "destination": to,
         "lead_name": _display_name_for_reference(reference_doctype, reference_name),
+        "reference_doctype": reference_doctype,
+        "reference_docname": reference_name,
     }
 
 
@@ -260,6 +262,9 @@ def handle_telnyx_webhook():
 
         elif event_type == "call.hangup":
             _call_ended(call_control_id, leg, state, call_log_name)
+
+        elif event_type == "call.recording.saved" and leg == "recording":
+            _save_recording(call_log_name, payload)
     except Exception:
         frappe.log_error("Telnyx Webhook CRASH", frappe.get_traceback())
 
@@ -287,6 +292,8 @@ def handle_telnyx_webhook():
                 "call_control_id": call_control_id,
                 "to": to_number,
                 "lead_name": lead_name,
+                "reference_doctype": ref_doctype,
+                "reference_docname": ref_name,
             },
             user=state.get("agent_user"),
         )
@@ -329,6 +336,7 @@ def _lead_answered(leg_b_id, state, call_log_name):
         return
 
     _post(f"/calls/{leg_a_id}/actions/bridge", {"call_control_id": leg_b_id})
+    _start_recording(leg_a_id, call_log_name)
 
     if call_log_name:
         frappe.db.set_value("CRM Call Log", call_log_name, "status", "In Progress")
@@ -342,9 +350,98 @@ def _call_ended(call_control_id, leg, state, call_log_name):
         frappe.db.commit()
 
 
+def _start_recording(call_control_id, call_log_name):
+    """Start recording a just-bridged call. Best-effort: a failure here
+    shouldn't take down the call itself, so it's caught and logged locally
+    rather than left to the webhook's outer try/except.
+    """
+    if not call_log_name:
+        return
+    client_state = _encode_state({"leg": "recording", "call_log": call_log_name})
+    try:
+        _post(
+            f"/calls/{call_control_id}/actions/record_start",
+            {
+                "format": "mp3",
+                "channels": "dual",
+                "client_state": client_state,
+            },
+        )
+    except Exception:
+        frappe.log_error(
+            "Telnyx Webhook", f"Failed to start recording for call_log {call_log_name}: {frappe.get_traceback()}"
+        )
+
+
+def _save_recording(call_log_name, payload):
+    """call.recording.saved: attach the recording URL to its CRM Call Log,
+    following the same recording_url field CRM's Twilio/Exotel integrations
+    already use - the Activity tab's player is provider-agnostic off that
+    field alone, nothing else needs to change for it to show up there.
+    """
+    if not call_log_name:
+        frappe.log_error("Telnyx Webhook", f"call.recording.saved with no call_log in state: {payload}")
+        return
+
+    # Prefer the unauthenticated public URL (recording_url is fetched with no
+    # provider auth for "Manual" telephony_medium - see crm.integrations.api
+    # get_recording_url/_get_recording_credentials); fall back to the
+    # authenticated one if that's all Telnyx sent.
+    urls = payload.get("public_recording_urls") or payload.get("recording_urls") or {}
+    recording_url = urls.get("mp3") or urls.get("wav")
+
+    # TEMPORARY DEBUG LOGGING - remove once recording capture is confirmed working
+    frappe.log_error(
+        "Telnyx Recording Saved",
+        f"call_log={call_log_name} recording_url={recording_url!r} raw_payload={payload}",
+    )
+
+    if not recording_url:
+        return
+
+    frappe.db.set_value("CRM Call Log", call_log_name, "recording_url", recording_url)
+    frappe.db.commit()
+
+
+def _agents_for_inbound_number(our_number):
+    """Which agent(s) should ring for a call to this DID?
+
+    If a User has telnyx_did set to this exact number, only they ring - the
+    ring-group is skipped entirely (one leg, not many). Otherwise every agent
+    with a pbx_extension set rings, as before. Both sides are normalized
+    before comparing for the same reason phone numbers are normalized
+    elsewhere in this file: formatting rarely matches exactly.
+    """
+    all_agents = frappe.get_all(
+        "User",
+        filters={"pbx_extension": ["is", "set"], "enabled": 1},
+        fields=["name", "pbx_extension", "telnyx_did"],
+    )
+
+    normalized_number = _normalize_phone(our_number)
+    if normalized_number:
+        for agent in all_agents:
+            if agent.telnyx_did and _normalize_phone(agent.telnyx_did) == normalized_number:
+                # TEMPORARY DEBUG LOGGING - remove once DID routing is confirmed working
+                frappe.log_error(
+                    "Telnyx DID Routing",
+                    f"to={our_number!r} normalized={normalized_number!r} -> assigned agent {agent.name}",
+                )
+                return [agent]
+
+    # TEMPORARY DEBUG LOGGING - remove once DID routing is confirmed working
+    frappe.log_error(
+        "Telnyx DID Routing",
+        f"to={our_number!r} normalized={normalized_number!r} - no DID assignment, "
+        f"ringing all {len(all_agents)} agent(s) with a pbx_extension",
+    )
+    return all_agents
+
+
 def _start_ring_group(call_control_id, payload):
-    """A brand-new inbound call landed on our number - ring every agent with a
-    pbx_extension at once. Whoever answers first gets bridged in
+    """A brand-new inbound call landed on our number - ring the assigned agent
+    if this DID has one (see _agents_for_inbound_number), otherwise every
+    agent with a pbx_extension at once. Whoever answers first gets bridged in
     _ring_group_agent_answered / _ring_group_bridge; the rest get cancelled.
     """
     customer_number = payload.get("from")
@@ -369,11 +466,7 @@ def _start_ring_group(call_control_id, payload):
 
     call_log.insert(ignore_permissions=True)
 
-    agents = frappe.get_all(
-        "User",
-        filters={"pbx_extension": ["is", "set"], "enabled": 1},
-        fields=["name", "pbx_extension"],
-    )
+    agents = _agents_for_inbound_number(our_number)
 
     agent_legs = {}
     for agent in agents:
@@ -463,6 +556,7 @@ def _ring_group_bridge(customer_call_id, ring_group):
         return
 
     _post(f"/calls/{customer_call_id}/actions/bridge", {"call_control_id": winner_leg_id})
+    _start_recording(customer_call_id, call_log_name)
 
     if call_log_name:
         frappe.db.set_value("CRM Call Log", call_log_name, "status", "In Progress")

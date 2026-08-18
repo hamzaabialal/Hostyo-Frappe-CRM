@@ -64,6 +64,8 @@ export const globalStore = defineStore('crm-global', () => {
         pendingCall.value = {
           number,
           lead_name: res?.lead_name || '',
+          reference_doctype: res?.reference_doctype || '',
+          reference_docname: res?.reference_docname || '',
         }
         toast.success('Calling ' + number + ' - answer your softphone')
       })
