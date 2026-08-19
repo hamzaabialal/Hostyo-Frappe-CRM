@@ -18,6 +18,7 @@
   - `frontend/src/App.vue` — registers TelnyxCallUI + RavenChat globally
   - `frontend/src/stores/global.js` — Make a Call button calls `pbx_integration.telnyx.create_click2call`
   - `frontend/src/components/Telephony/TelnyxCallUI.vue` — in-CRM call widget (WebRTC, mute/hold/hangup, live caller name as a clickable link to the Lead/Deal/Contact, inbound Answer/Decline UI with a generated ringtone)
+  - `frontend/src/components/Modals/CallLogDetailModal.vue` — the "Call Details" popup opened from a call in the Calls/Activity tab (Lead/Deal/Contact-aware reference link; everything else — direction, participants, date, duration, status, recording player, notes — was already provider-agnostic in the stock component)
   - `frontend/src/components/RavenChat.vue` — custom Raven chat dock (repositioned, Hostyo branding)
   - `frontend/src/components/Activities/Activities.vue`, `SMSArea.vue`, `SMSBox.vue`, `WhatsAppBox.vue` — SMS/WhatsApp activity tabs
   - `frontend/src/components/Icons/SMSIcon.vue` — SMS icon
@@ -70,6 +71,17 @@ A call to our Telnyx number rings either one specific agent or every agent, depe
 ## Call recording
 
 `_start_recording` fires `record_start` (mp3, dual-channel) right after each bridge — leg A for outbound, the customer's leg for inbound — tagged with `client_state` so the eventual `call.recording.saved` webhook can be traced back to its `CRM Call Log`. `_save_recording` writes the recording URL (preferring Telnyx's `public_recording_urls`, which need no further auth, over the authenticated `recording_urls`) into the standard `recording_url` field. Nothing else needed on the frontend: CRM's own `CallArea.vue`/`AudioPlayer.vue` and the `get_recording_url` proxy already render and stream any call log with `recording_url` set, regardless of provider — confirmed against the `frappe/crm` source, since `_get_recording_credentials` explicitly falls back to no-auth for a `telephony_medium` it doesn't recognize (this integration uses `"Manual"`).
+
+## Call Details modal
+
+`crm/components/Modals/CallLogDetailModal.vue` (the popup opened from a call row in the Calls/Activity tab) is core CRM, shared across every telephony provider — it already renders direction, caller↔receiver avatars, a Lead/Deal link, date, duration, status, a recording player, and a notes section, all off plain `CRM Call Log` fields. Checked it directly against the `frappe/crm` source before touching it, since it's exactly the kind of thing worth verifying rather than assuming:
+
+- **Notes**: no new field needed. The "Add Note" button already creates/edits an `FCRM Note` linked to the call log (`crm.integrations.api.add_note_to_call_log`) and renders it in a "Details"-style block — this is provider-agnostic already and works for Telnyx calls with zero changes.
+- **Recording player**: also already generic (`<audio controls :src="recording_url_path">` with a graceful "Recording not available" fallback on error) — confirms the earlier recording work needs no frontend changes, only that `recording_url` gets set, which it does.
+- **Reference link gap (fixed)**: the stock component only ever showed a Lead/Deal link, because upstream's Twilio/Exotel flows never link a bare Contact. Our inbound caller-ID lookup (`_find_caller_reference`) can resolve a Contact when no Lead/Deal matches, so the stock component would silently drop that link. Copied into `crm-customizations` with a third case added, driven off `reference_doctype`/`reference_docname` directly.
+- **Duration field (fixed)**: `telnyx.py` set `start_time`/`end_time` but never `duration` itself, and the CRM Call Log controller has no hook that derives one — every Telnyx call was showing "0s" regardless of actual length. `_call_ended` now computes it from the two timestamps.
+- **Caller/receiver field (fixed)**: `CRM Call Log` models these as two distinct fields depending on call type (`receiver` = who answered an Incoming call, `caller` = who placed an Outgoing one — confirmed in the doctype JSON's `depends_on`). `_ring_group_agent_answered` was setting `caller` for inbound calls, which the modal never reads for that direction — the agent's avatar/name would render blank. Now sets `receiver`.
+- **Known nuance, not a bug**: the caller↔receiver avatar row's *external-party* side is resolved by a separate, independent lookup — core's own `get_contact_by_phone_number`, which only checks the `Contact` doctype — not by our `reference_doctype`/`reference_docname`. So a call linked to a Lead with no associated Contact record can show "Unknown" in that top row while the Lead link/badge below is still correct. This is identical behavior for Twilio/Exotel calls today, not something specific to this integration, so it was left alone rather than changing shared core behavior.
 
 ## Known context / history
 This app previously integrated with PBX.im (removed in favor of Telnyx — PBX.im lacked webhook support for real-time call status). See git history if that code is ever needed for reference.

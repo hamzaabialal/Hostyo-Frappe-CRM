@@ -392,10 +392,22 @@ def _call_ended(call_control_id, leg, state, call_log_name):
         # Answer" _lead_hangup just set) back to a generic "Completed" -
         # this fires again when the leg-A hangup that _lead_hangup triggers
         # comes back through as its own webhook event.
-        if frappe.db.get_value("CRM Call Log", call_log_name, "status") == "No Answer":
+        current_status, start_time = frappe.db.get_value(
+            "CRM Call Log", call_log_name, ["status", "start_time"]
+        )
+        if current_status == "No Answer":
             return
+
+        end_time = frappe.utils.now_datetime()
         frappe.db.set_value("CRM Call Log", call_log_name, "status", "Completed")
-        frappe.db.set_value("CRM Call Log", call_log_name, "end_time", frappe.utils.now_datetime())
+        frappe.db.set_value("CRM Call Log", call_log_name, "end_time", end_time)
+        # Nothing computes this from start_time/end_time on its own - the
+        # doctype controller has no such hook - and CallLogDetailModal.vue
+        # reads it directly, so without this every call would show "0s".
+        if start_time:
+            frappe.db.set_value(
+                "CRM Call Log", call_log_name, "duration", (end_time - start_time).total_seconds()
+            )
         frappe.db.commit()
 
 
@@ -589,7 +601,11 @@ def _ring_group_agent_answered(agent_leg_id, state, call_log_name):
             _post(f"/calls/{leg_id}/actions/hangup", {})
 
     if call_log_name:
-        frappe.db.set_value("CRM Call Log", call_log_name, "caller", agent_user)
+        # CRM Call Log models "caller" (Outgoing) and "receiver" (Incoming) as
+        # distinct fields - "receiver" is who answered an inbound call, and
+        # it's what CallLogDetailModal.vue reads for the agent's avatar/name
+        # on this call's Incoming side. "caller" would just sit unused.
+        frappe.db.set_value("CRM Call Log", call_log_name, "receiver", agent_user)
         frappe.db.commit()
 
     _post(f"/calls/{customer_call_id}/actions/answer", {})
