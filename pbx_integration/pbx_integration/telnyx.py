@@ -1,9 +1,12 @@
 import base64
 import json
+import os
 import re
 
 import frappe
 import requests
+import werkzeug.utils
+from frappe import _
 
 TELNYX_API_BASE = "https://api.telnyx.com/v2"
 
@@ -561,6 +564,89 @@ def _save_recording(call_log_name, payload):
     frappe.log_error(
         "Telnyx Recording Saved",
         f"call_log={call_log_name} FINAL recording_url={recording_url!r}",
+    )
+
+
+@frappe.whitelist()
+def get_recording(call_log_name):
+    """Stream a locally re-hosted Telnyx recording straight from disk,
+    gated on the requesting user's own read permission for the CRM Call Log
+    it's attached to.
+
+    A dedicated endpoint rather than pointing recording_url_path at
+    Frappe's own /private/files/ route: that route works the same way
+    security-wise (it delegates to the identical File.has_permission ->
+    CRM Call Log.has_permission("read") chain used below) but it's
+    unmodified core code with nowhere to add TEMPORARY DEBUG LOGGING when
+    something needs diagnosing on a live site - which is exactly why this
+    exists instead.
+    """
+    user = frappe.session.user
+
+    if not call_log_name or not frappe.db.exists("CRM Call Log", call_log_name):
+        # TEMPORARY DEBUG LOGGING - remove once recording playback is confirmed working
+        frappe.log_error(
+            "Telnyx Recording Access",
+            f"user={user} call_log_name={call_log_name!r} - call log not found",
+        )
+        frappe.throw(_("Call log not found"), frappe.DoesNotExistError)
+
+    log = frappe.get_doc("CRM Call Log", call_log_name)
+
+    try:
+        log.check_permission("read")
+    except frappe.PermissionError:
+        # TEMPORARY DEBUG LOGGING - remove once recording playback is confirmed working
+        frappe.log_error(
+            "Telnyx Recording Access",
+            f"user={user} call_log_name={call_log_name} status=DENIED - check_permission('read') raised "
+            f"(reference={log.reference_doctype}/{log.reference_docname})",
+        )
+        raise
+
+    # TEMPORARY DEBUG LOGGING - remove once recording playback is confirmed working
+    frappe.log_error(
+        "Telnyx Recording Access",
+        f"user={user} call_log_name={call_log_name} status=GRANTED recording_url={log.recording_url!r}",
+    )
+
+    if not log.recording_url:
+        frappe.throw(_("Recording not found"), frappe.DoesNotExistError)
+
+    file_name = frappe.db.get_value(
+        "File",
+        {
+            "attached_to_doctype": "CRM Call Log",
+            "attached_to_name": call_log_name,
+            "attached_to_field": "recording_url",
+        },
+        "name",
+    )
+    if not file_name:
+        # TEMPORARY DEBUG LOGGING - remove once recording playback is confirmed working
+        frappe.log_error(
+            "Telnyx Recording Access",
+            f"call_log_name={call_log_name} - recording_url is set but no matching File record found",
+        )
+        frappe.throw(_("Recording file not found"), frappe.DoesNotExistError)
+
+    file_doc = frappe.get_doc("File", file_name)
+    file_path = file_doc.get_full_path()
+
+    if not os.path.exists(file_path):
+        # TEMPORARY DEBUG LOGGING - remove once recording playback is confirmed working
+        frappe.log_error(
+            "Telnyx Recording Access",
+            f"call_log_name={call_log_name} file={file_name} - resolved path missing on disk: {file_path}",
+        )
+        frappe.throw(_("Recording file missing"), frappe.DoesNotExistError)
+
+    return werkzeug.utils.send_file(
+        file_path,
+        environ=frappe.local.request.environ,
+        conditional=True,
+        mimetype="audio/mpeg",
+        download_name=file_doc.file_name,
     )
 
 

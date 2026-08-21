@@ -150,18 +150,19 @@ class CRMCallLog(Document):
 			# problem for a locally-hosted file two ways over: many hosts
 			# can't loop a request back through their own public IP (no
 			# hairpin NAT), and the proxy has no session to authenticate a
-			# private file with anyway. Point straight at Frappe's own
-			# /private/files/ route instead: it rejects Guest outright and
-			# checks permission via File.has_permission, which for a file
-			# with attached_to_doctype/name set defers to that document's
-			# own has_permission("read") - i.e. this CRM Call Log's normal
-			# read permission, the same rule used everywhere else - then
-			# streams the bytes straight from disk (werkzeug send_file,
-			# Range support included) with no re-fetch of any kind.
-			# Twilio/Exotel's genuine external provider URLs still go
-			# through the proxy exactly as before.
+			# private file with anyway. Route these through
+			# pbx_integration.telnyx.get_recording instead, which checks
+			# this CRM Call Log's own read permission (the same rule used
+			# everywhere else) and streams the bytes straight from disk -
+			# a dedicated endpoint rather than Frappe's own equivalent
+			# /private/files/ route so there's somewhere to add debug
+			# logging when something needs diagnosing. Twilio/Exotel's
+			# genuine external provider URLs still go through the original
+			# proxy exactly as before.
 			if recording_url.startswith(frappe.utils.get_url()):
-				d["recording_url_path"] = recording_url
+				d["recording_url_path"] = (
+					f"/api/method/pbx_integration.telnyx.get_recording?call_log_name={d.get('name')}"
+				)
 			else:
 				d["recording_url_path"] = (
 					f"/api/method/crm.integrations.api.get_recording_url?call_log_name={d.get('name')}"
