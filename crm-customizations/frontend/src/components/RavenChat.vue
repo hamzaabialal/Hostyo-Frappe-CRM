@@ -49,7 +49,7 @@
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount } from 'vue'
-import logoUrl from '../assets/hostyo-logo.jpg'
+import logoUrl from '../assets/hostyo-logo-new.png'
 
 const props = defineProps({
   ravenUrl: { type: String, default: '/raven' },
@@ -88,6 +88,15 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   border-radius: 10px 10px 0 0;
   box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.12);
   overflow: hidden;
+}
+
+/* Collapsed: only as wide as the bar itself needs, not the full open-panel
+   width above - otherwise the minimized bar sits as wide as the chat panel
+   and covers/blocks whatever's underneath it (worst on mobile). */
+.raven-dock:not(.is-open) {
+  width: fit-content;
+  min-width: 170px;
+  max-width: calc(100vw - 24px);
 }
 
 /* Bar */
@@ -170,7 +179,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 
 /* Mobile */
 @media (max-width: 640px) {
-  .raven-dock {
+  .raven-dock.is-open {
     left: 12px;
     right: 12px;
     width: auto;
@@ -178,6 +187,14 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   }
   .raven-dock.is-open .raven-dock__body {
     height: 68vh;
+  }
+
+  /* Collapsed stays docked to the right and content-width, like desktop -
+     not stretched edge to edge, so it doesn't sit over other controls. */
+  .raven-dock:not(.is-open) {
+    right: 12px;
+    min-width: 150px;
+    max-width: calc(100vw - 24px);
   }
 }
 </style>

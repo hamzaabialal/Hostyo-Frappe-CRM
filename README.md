@@ -27,7 +27,7 @@
   - `frontend/src/components/ListBulkActions.vue` — bulk actions (SMS-related)
   - `frontend/src/composables/telephony.js`, `sms.js` — telephony/SMS composables
   - `frontend/src/pages/Deal.vue`, `Lead.vue` — Deal/Lead detail pages
-  - `frontend/src/assets/hostyo-logo.jpg` — Hostyo branding asset (used by RavenChat.vue)
+  - `frontend/src/assets/hostyo-logo-new.png` — Hostyo branding asset (used by RavenChat.vue)
   - `frontend/vite.config.js` — PWA `selfDestroying: true` (fixes stale service-worker cache bug)
   - `frontend/package.json`, `yarn.lock`, `auto-imports.d.ts` — dependency/build metadata (includes `@telnyx/webrtc`)
 
