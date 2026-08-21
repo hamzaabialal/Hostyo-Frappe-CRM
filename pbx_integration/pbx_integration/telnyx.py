@@ -16,6 +16,14 @@ RING_TIMEOUT_SECS = 25
 # last-agent timeout can't outlive its own bookkeeping.
 RING_GROUP_CACHE_TTL = 120
 
+# How long (seconds) to remember which CRM Call Log / agent a bridged
+# inbound call's customer leg belongs to. The customer's own Telnyx leg is
+# never tagged with our client_state (we don't originate it), so once the
+# ring-group cache entry is cleared at bridge time there'd be no way to
+# resolve its call log when that leg later hangs up - long enough to
+# comfortably outlive any real call.
+CUSTOMER_CALL_STATE_TTL = 4 * 60 * 60
+
 
 def _api_key():
     key = frappe.conf.get("telnyx_api_key")
@@ -86,6 +94,10 @@ def _agent_sip_username(user):
 
 def _ring_group_cache_key(customer_call_id):
     return f"telnyx_ring_group:{customer_call_id}"
+
+
+def _customer_leg_state_cache_key(customer_call_id):
+    return f"telnyx_customer_leg:{customer_call_id}"
 
 
 def _normalize_phone(number):
@@ -237,6 +249,19 @@ def handle_telnyx_webhook():
     ring_group = None
     if not leg and call_control_id:
         ring_group = frappe.cache().get_value(_ring_group_cache_key(call_control_id))
+
+    # The customer leg of a bridged inbound call still has no client_state of
+    # its own at this point (see _customer_leg_state_cache_key), so once the
+    # ring-group cache entry above is gone (already bridged), call_log_name
+    # would otherwise stay unresolved for the rest of that call - including
+    # its final call.hangup, which is what actually finalizes the CRM Call
+    # Log (status/duration). Fall back to the longer-lived mapping written in
+    # _ring_group_agent_answered.
+    if not leg and call_control_id and not call_log_name:
+        customer_state = frappe.cache().get_value(_customer_leg_state_cache_key(call_control_id))
+        if customer_state:
+            call_log_name = customer_state.get("call_log")
+            state = {**state, **customer_state}
 
     try:
         if event_type == "call.initiated" and not leg and not ring_group and payload.get("direction") == "incoming":
@@ -409,6 +434,10 @@ def _call_ended(call_control_id, leg, state, call_log_name):
                 "CRM Call Log", call_log_name, "duration", (end_time - start_time).total_seconds()
             )
         frappe.db.commit()
+
+    # No-op if call_control_id isn't a customer leg (never set under this
+    # key) - always safe to clear once a call is done with it.
+    frappe.cache().delete_value(_customer_leg_state_cache_key(call_control_id))
 
 
 def _start_recording(call_control_id, call_log_name, agent_user=None):
@@ -683,10 +712,23 @@ def _ring_group_agent_answered(agent_leg_id, state, call_log_name):
         frappe.db.set_value("CRM Call Log", call_log_name, "receiver", agent_user)
         frappe.db.commit()
 
-    # Tag the customer leg's own client_state here too (previously left
-    # unset) so its call.answered confirmation - and everything after it
-    # until _start_recording re-tags it - still passes the realtime-publish
-    # block's agent_user check instead of silently going unpublished.
+        # See _customer_leg_state_cache_key: this is a fallback record of
+        # which call log/agent the customer's leg belongs to, independent of
+        # the client_state tagged on the answer action below. Without it, a
+        # call the customer hangs up first (the common case) could go
+        # unfinalized once the ring-group cache clears at bridge time, if
+        # that client_state is ever lost or not echoed back as expected.
+        frappe.cache().set_value(
+            _customer_leg_state_cache_key(customer_call_id),
+            {"call_log": call_log_name, "agent_user": agent_user},
+            expires_in_sec=CUSTOMER_CALL_STATE_TTL,
+        )
+
+    # Tag the customer leg's own client_state too (previously left unset) so
+    # its call.answered confirmation - and everything after it until
+    # _start_recording re-tags it - still passes the realtime-publish
+    # block's agent_user check instead of silently going unpublished. This
+    # is the primary path; the cache entry above is the fallback.
     answer_state = _encode_state({"call_log": call_log_name, "agent_user": agent_user})
     try:
         _post(f"/calls/{customer_call_id}/actions/answer", {"client_state": answer_state})
