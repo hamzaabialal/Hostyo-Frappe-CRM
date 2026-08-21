@@ -13,6 +13,7 @@
   **Backend:**
   - `crm/api/activities.py` — activity/timeline logic (SMS support added)
   - `crm/fcrm/doctype/crm_lead/crm_lead.json` + `.py` — Lead doctype (custom fields/logic)
+  - `crm/fcrm/doctype/crm_call_log/crm_call_log.py` — `CRMCallLog.as_dict()` serves locally re-hosted recordings directly instead of through the provider-fetch proxy (see "Call recording" below)
 
   **Frontend:**
   - `frontend/src/App.vue` — registers TelnyxCallUI + RavenChat globally
@@ -38,7 +39,7 @@
 4. `bench --site <site> migrate` — runs `patches/add_telnyx_did_field.py`, which adds the `telnyx_did` custom field to User
 5. Set `pbx_extension` on each agent's User record to their Telnyx SIP Credential Connection username. Optionally also set `telnyx_did` (E.164) on any agent who should get their own direct number instead of the shared ring-group — see "Inbound calling" below
 6. In the Telnyx portal, assign your inbound phone number(s) to the same Voice API / Call Control connection as `telnyx_connection_id`, with its webhook URL pointed at `<site>/api/method/pbx_integration.telnyx.handle_telnyx_webhook` — inbound ring-group routing (below) relies on webhooks for that connection reaching this same endpoint. Also enable that connection for Call Control's recording feature if you haven't already (needed for `record_start` to succeed)
-7. Rebuild: `bench build --app crm` (or `yarn build` inside `apps/crm/frontend`)
+7. Rebuild: `bench build --app crm` (or `yarn build` inside `apps/crm/frontend`), then `bench restart` (or restart the site's workers) — the `crm_call_log.py` controller change needs a Python process restart to take effect, not just a rebuild
 
 ## Outbound calling
 
@@ -92,6 +93,32 @@ The actual cause, confirmed by that same schema: `recording_urls` is **"valid fo
 Fixed by having `_save_recording` download the file immediately (server-side, while the link is still guaranteed fresh — this is the very webhook telling us it just became available) and re-host it as a permanent, public Frappe `File` attached to the call log; `recording_url` is then set to that file's own absolute URL (`frappe.utils.get_url(file_doc.file_url)` — must be absolute, not the bare `/files/...` path, since `get_recording_url`'s own fetch validates for a scheme+host) rather than Telnyx's. This sidesteps the expiry entirely and doesn't depend on Telnyx support activating anything. Falls back to storing Telnyx's URL directly (previous behavior) only if the download itself fails.
 
 Recording format was also double-checked: `_start_recording` requests `"format": "mp3"` explicitly, which every major browser's `<audio>` element plays natively — not the cause.
+
+### Debugged (part 2): still "Recording not available" after re-hosting the file
+
+The re-hosting fix above stores a working, permanent file — but the player still routes through it via `recording_url_path`, which core's `CRMCallLog.as_dict()` *always* computes as the `get_recording_url` proxy URL, unconditionally, for any provider. That proxy makes *this server* fetch whatever `recording_url` holds over plain HTTP — including, now, its own public URL. Plenty of hosts can't loop a request back through their own public IP (no hairpin NAT/NAT reflection) — the self-fetch can hang or fail even though the file is sitting there correctly, and the failure looks identical from the browser's side: `<audio>`'s `@error` fires, "Recording not available".
+
+Fixed by customizing `CRMCallLog.as_dict()` (`crm-customizations/crm/fcrm/doctype/crm_call_log/crm_call_log.py`) to detect when `recording_url` is already this site's own URL (`recording_url.startswith(frappe.utils.get_url())`) and, only then, point `recording_url_path` straight at it — no proxy round-trip, no fetch-your-own-IP risk. Twilio/Exotel recordings (genuinely external provider URLs) are completely unaffected and still go through the original proxy exactly as before; the rest of `crm_call_log.py` is byte-for-byte the upstream file.
+
+**Nothing needed in the Telnyx dashboard for this.** `record_start`/`call.recording.saved` are driven entirely by the Call Control API calls this integration already makes — there's no separate recording toggle to enable for that mechanism. The one Telnyx-side option that *would* help (though no longer required, since recordings are now re-hosted immediately) is asking Telnyx support to activate `public_recording_urls` on the account, which removes the 10-minute expiry window entirely rather than racing it.
+
+### Debugged (part 3): locking recordings down to permissioned users only
+
+Part 2 initially stored the re-hosted file as a *public* Frappe File — reachable by anyone with the direct link, not just logged-in CRM users with read access to that call log. Fixed by switching to a private file and routing through Frappe's own permission-checked file route instead of a public URL or a hand-rolled endpoint.
+
+Read Frappe core's actual file-serving path (`frappe/app.py` → `frappe.utils.response.download_private_file` → `frappe.core.doctype.file.utils.find_file_by_url` → `File.has_permission`) before building anything, rather than assume how `/private/files/` behaves. It turns out this already does everything a custom streaming endpoint would need to:
+
+- **Rejects Guest outright** — `download_private_file` checks `frappe.session.user == "Guest"` before anything else.
+- **Checks real permission, not just "logged in"** — `File.has_permission` special-cases files with `attached_to_doctype`/`attached_to_name` set (which `_save_recording` already sets, to `CRM Call Log`) and defers straight to that document's own `has_permission("read")` — the exact same permission rule the rest of the CRM already uses for that doctype (role-based, ownership, sharing, whatever it resolves to), not a separately-invented check.
+- **Serves bytes straight from disk** — `werkzeug.utils.send_file(filepath, ..., conditional=True)`, no HTTP re-fetch of any kind, so the hairpin-NAT/self-fetch failure mode from part 2 can't recur either.
+- **Range requests for free** — `conditional=True` gives seeking/duration support automatically, more robust than the original proxy's own hand-rolled `Range` forwarding.
+
+Writing a custom whitelisted method would have meant re-implementing permission checks, path safety, and Range handling that Frappe already ships and has already hardened — more code, more surface area to get wrong, for a result no more secure than just using the built-in route. So `_save_recording` now creates the File with `is_private: 1` instead of `0`; no other code changed, since `crm_call_log.py`'s routing logic already only checks "is this our own site's URL" — true for both `/files/...` and `/private/files/...` — so it transparently starts pointing at the permission-checked path.
+
+**Verification**: I confirmed this logic by reading Frappe's actual source for the permission chain and file-serving mechanics described above, and both files compile cleanly. I don't have access to this bench or a live Telnyx account from here, so I could not personally place a real call and click play, or send a live logged-out request against the deployed site — once this is deployed, please:
+1. Make a real inbound or outbound call, open its Call Details modal, and confirm the recording plays for a normal logged-in user.
+2. Check Frappe's Error Log for the `Telnyx Recording Saved` entries — the final one logs the exact stored URL (`FINAL recording_url=...`), which will now be a `/private/files/...` path.
+3. Copy that URL and open it in a logged-out/incognito browser tab (or `curl` it without a session cookie) — it should be rejected, not play.
 
 ## Call Details modal
 

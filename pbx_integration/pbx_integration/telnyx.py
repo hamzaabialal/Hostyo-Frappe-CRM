@@ -482,7 +482,7 @@ def _save_recording(call_log_name, payload):
     working once it expires: the recording still shows as "attached" (the
     field has a value), but the player can no longer load it. Fetching the
     file now, while the link is still guaranteed fresh, and re-hosting it as
-    our own Frappe File sidesteps the expiry entirely.
+    our own private Frappe File sidesteps the expiry entirely.
     """
     if not call_log_name:
         frappe.log_error("Telnyx Webhook", f"call.recording.saved with no call_log in state: {payload}")
@@ -528,12 +528,22 @@ def _save_recording(call_log_name, payload):
                 "attached_to_name": call_log_name,
                 "attached_to_field": "recording_url",
                 "content": resp.content,
-                "is_private": 0,
+                # Private, not public: with attached_to_doctype/name set,
+                # Frappe's own /private/files/ route (frappe.utils.response.
+                # download_private_file) rejects Guest outright and, for
+                # everyone else, checks permission via File.has_permission
+                # -> CRM Call Log's own has_permission("read") - the same
+                # rule the rest of the CRM already relies on for this
+                # doctype. Serves the bytes straight from disk either way
+                # (werkzeug send_file, conditional=True gives Range support
+                # for free) - no re-fetch, so no self-fetch/NAT risk either.
+                "is_private": 1,
             }
         )
         file_doc.insert(ignore_permissions=True)
-        # Absolute URL, not the bare /files/... path get_recording_url returns -
-        # the proxy's own fetch requires a scheme+host to pass its URL validation.
+        # Absolute URL, not the bare /private/files/... path - the
+        # crm_call_log.py override below matches on the site's own host to
+        # decide whether to skip the get_recording_url proxy.
         recording_url = frappe.utils.get_url(file_doc.file_url)
         # TEMPORARY DEBUG LOGGING - remove once recording capture is confirmed working
         frappe.log_error(
@@ -543,6 +553,15 @@ def _save_recording(call_log_name, payload):
 
     frappe.db.set_value("CRM Call Log", call_log_name, "recording_url", recording_url)
     frappe.db.commit()
+
+    # TEMPORARY DEBUG LOGGING - remove once recording capture is confirmed working.
+    # This is the URL actually stored, regardless of which branch above ran -
+    # open it directly in a browser (logged out) to check it's independently
+    # reachable, separate from whether the CRM's own player can load it.
+    frappe.log_error(
+        "Telnyx Recording Saved",
+        f"call_log={call_log_name} FINAL recording_url={recording_url!r}",
+    )
 
 
 def _agents_for_inbound_number(our_number):
