@@ -355,7 +355,7 @@ def _lead_answered(leg_b_id, state, call_log_name):
     frappe.cache().delete_value(_leg_b_pending_cache_key(leg_b_id))
 
     _post(f"/calls/{leg_a_id}/actions/bridge", {"call_control_id": leg_b_id})
-    _start_recording(leg_a_id, call_log_name)
+    _start_recording(leg_a_id, call_log_name, state.get("agent_user"))
 
     if call_log_name:
         frappe.db.set_value("CRM Call Log", call_log_name, "status", "In Progress")
@@ -411,14 +411,20 @@ def _call_ended(call_control_id, leg, state, call_log_name):
         frappe.db.commit()
 
 
-def _start_recording(call_control_id, call_log_name):
+def _start_recording(call_control_id, call_log_name, agent_user=None):
     """Start recording a just-bridged call. Best-effort: a failure here
     shouldn't take down the call itself, so it's caught and logged locally
     rather than left to the webhook's outer try/except.
+
+    Carries agent_user forward into the recording-tagged client_state -
+    without it, every later webhook for this leg (crucially, its own
+    eventual hangup) would fail the "state.get('agent_user')" check in the
+    realtime-publish block at the bottom of handle_telnyx_webhook, and the
+    frontend would never hear about anything that happens after this point.
     """
     if not call_log_name:
         return
-    client_state = _encode_state({"leg": "recording", "call_log": call_log_name})
+    client_state = _encode_state({"leg": "recording", "call_log": call_log_name, "agent_user": agent_user})
     try:
         _post(
             f"/calls/{call_control_id}/actions/record_start",
@@ -435,30 +441,76 @@ def _start_recording(call_control_id, call_log_name):
 
 
 def _save_recording(call_log_name, payload):
-    """call.recording.saved: attach the recording URL to its CRM Call Log,
-    following the same recording_url field CRM's Twilio/Exotel integrations
-    already use - the Activity tab's player is provider-agnostic off that
-    field alone, nothing else needs to change for it to show up there.
+    """call.recording.saved: download the recording immediately and attach a
+    permanent copy to its CRM Call Log, following the same recording_url
+    field CRM's Twilio/Exotel integrations use - the Activity tab's player
+    and CallLogDetailModal.vue are provider-agnostic off that field alone.
+
+    Per Telnyx's own schema, recording_urls is only valid for 10 minutes
+    after saving, and public_recording_urls (no expiry) requires Telnyx
+    support to activate per-account - not something this integration can
+    assume is on. Storing either URL directly means playback silently stops
+    working once it expires: the recording still shows as "attached" (the
+    field has a value), but the player can no longer load it. Fetching the
+    file now, while the link is still guaranteed fresh, and re-hosting it as
+    our own Frappe File sidesteps the expiry entirely.
     """
     if not call_log_name:
         frappe.log_error("Telnyx Webhook", f"call.recording.saved with no call_log in state: {payload}")
         return
 
-    # Prefer the unauthenticated public URL (recording_url is fetched with no
-    # provider auth for "Manual" telephony_medium - see crm.integrations.api
-    # get_recording_url/_get_recording_credentials); fall back to the
-    # authenticated one if that's all Telnyx sent.
+    # Prefer the no-expiry public URL when the account has it activated;
+    # otherwise the 10-minute one, which is why this must be fetched now.
     urls = payload.get("public_recording_urls") or payload.get("recording_urls") or {}
-    recording_url = urls.get("mp3") or urls.get("wav")
+    if urls.get("mp3"):
+        source_url, file_ext = urls.get("mp3"), "mp3"
+    elif urls.get("wav"):
+        source_url, file_ext = urls.get("wav"), "wav"
+    else:
+        source_url, file_ext = None, None
 
     # TEMPORARY DEBUG LOGGING - remove once recording capture is confirmed working
     frappe.log_error(
         "Telnyx Recording Saved",
-        f"call_log={call_log_name} recording_url={recording_url!r} raw_payload={payload}",
+        f"call_log={call_log_name} source_url={source_url!r} file_ext={file_ext} raw_payload={payload}",
     )
 
-    if not recording_url:
+    if not source_url:
         return
+
+    recording_url = source_url
+    try:
+        resp = requests.get(source_url, timeout=30)
+        resp.raise_for_status()
+    except Exception:
+        # Fall back to Telnyx's own URL - works until it expires, better
+        # than nothing if the download itself is what failed.
+        frappe.log_error(
+            "Telnyx Webhook",
+            f"Failed to download recording for call_log {call_log_name} from {source_url}: "
+            f"{frappe.get_traceback()}",
+        )
+    else:
+        file_doc = frappe.get_doc(
+            {
+                "doctype": "File",
+                "file_name": f"{call_log_name}-recording.{file_ext}",
+                "attached_to_doctype": "CRM Call Log",
+                "attached_to_name": call_log_name,
+                "attached_to_field": "recording_url",
+                "content": resp.content,
+                "is_private": 0,
+            }
+        )
+        file_doc.insert(ignore_permissions=True)
+        # Absolute URL, not the bare /files/... path get_recording_url returns -
+        # the proxy's own fetch requires a scheme+host to pass its URL validation.
+        recording_url = frappe.utils.get_url(file_doc.file_url)
+        # TEMPORARY DEBUG LOGGING - remove once recording capture is confirmed working
+        frappe.log_error(
+            "Telnyx Recording Saved",
+            f"call_log={call_log_name} re-hosted as {file_doc.file_url} -> {recording_url}",
+        )
 
     frappe.db.set_value("CRM Call Log", call_log_name, "recording_url", recording_url)
     frappe.db.commit()
@@ -526,6 +578,13 @@ def _start_ring_group(call_control_id, payload):
         call_log.reference_docname = reference_name
 
     call_log.insert(ignore_permissions=True)
+    # Commit before dialing anyone: dialing is an external HTTP call to Telnyx,
+    # which can trigger a webhook back to a *different* worker almost
+    # immediately (the agent leg's own call.initiated). Without this, that
+    # webhook's read of reference_doctype/reference_docname can race ahead of
+    # this transaction's commit and see nothing - the call log looks
+    # unlinked at ring-time even though it's correctly linked moments later.
+    frappe.db.commit()
 
     agents = _agents_for_inbound_number(our_number)
 
@@ -589,11 +648,27 @@ def _ring_group_agent_answered(agent_leg_id, state, call_log_name):
     cache_key = _ring_group_cache_key(customer_call_id)
     ring_group = frappe.cache().get_value(cache_key)
 
+    # TEMPORARY DEBUG LOGGING - remove once the inbound answered/No-Answer flow is confirmed working
+    frappe.log_error(
+        "Telnyx Ring Group Answered",
+        f"agent_leg_id={agent_leg_id} agent_user={agent_user} customer_call_id={customer_call_id} "
+        f"call_log={call_log_name} cache_key={cache_key} ring_group_found={bool(ring_group)} "
+        f"existing_winner={ring_group.get('winner') if ring_group else None}",
+    )
+
     if not ring_group or ring_group.get("winner"):
+        frappe.log_error(
+            "Telnyx Ring Group Answered",
+            f"agent_leg_id={agent_leg_id} too late or ring group already gone - hanging this leg back up "
+            f"(ring_group_found={bool(ring_group)}, winner={ring_group.get('winner') if ring_group else None})",
+        )
         _post(f"/calls/{agent_leg_id}/actions/hangup", {})
         return
 
     ring_group["winner"] = agent_leg_id
+    # Carried through to _ring_group_bridge, which otherwise has no way to
+    # know which agent answered - it only gets called with the cache dict.
+    ring_group["winner_agent_user"] = agent_user
     frappe.cache().set_value(cache_key, ring_group, expires_in_sec=RING_GROUP_CACHE_TTL)
 
     for leg_id in ring_group["agent_legs"]:
@@ -608,24 +683,70 @@ def _ring_group_agent_answered(agent_leg_id, state, call_log_name):
         frappe.db.set_value("CRM Call Log", call_log_name, "receiver", agent_user)
         frappe.db.commit()
 
-    _post(f"/calls/{customer_call_id}/actions/answer", {})
+    # Tag the customer leg's own client_state here too (previously left
+    # unset) so its call.answered confirmation - and everything after it
+    # until _start_recording re-tags it - still passes the realtime-publish
+    # block's agent_user check instead of silently going unpublished.
+    answer_state = _encode_state({"call_log": call_log_name, "agent_user": agent_user})
+    try:
+        _post(f"/calls/{customer_call_id}/actions/answer", {"client_state": answer_state})
+    except Exception:
+        frappe.log_error(
+            "Telnyx Ring Group Answered",
+            f"Failed to answer customer leg {customer_call_id} for call_log {call_log_name}: "
+            f"{frappe.get_traceback()}",
+        )
+        raise
 
 
 def _ring_group_bridge(customer_call_id, ring_group):
     """The customer's leg is now answered - bridge it to the winning agent."""
     winner_leg_id = ring_group.get("winner")
     call_log_name = ring_group.get("call_log")
+    agent_user = ring_group.get("winner_agent_user")
+
+    # TEMPORARY DEBUG LOGGING - remove once the inbound answered/No-Answer flow is confirmed working
+    frappe.log_error(
+        "Telnyx Ring Group Bridge",
+        f"customer_call_id={customer_call_id} winner_leg_id={winner_leg_id} "
+        f"call_log={call_log_name} agent_user={agent_user}",
+    )
 
     if not winner_leg_id:
         frappe.log_error("Telnyx Webhook", f"Ring group {customer_call_id} answered with no winner on record.")
         return
 
-    _post(f"/calls/{customer_call_id}/actions/bridge", {"call_control_id": winner_leg_id})
-    _start_recording(customer_call_id, call_log_name)
+    try:
+        _post(f"/calls/{customer_call_id}/actions/bridge", {"call_control_id": winner_leg_id})
+    except Exception:
+        # Bridge itself failed (e.g. the winning leg was already gone) - the
+        # call never actually connected despite being "answered", so leaving
+        # status at "Initiated" would be misleading and skipping straight to
+        # recording/"In Progress" below would be flat wrong. Mark it plainly.
+        frappe.log_error(
+            "Telnyx Ring Group Bridge",
+            f"BRIDGE FAILED customer_call_id={customer_call_id} winner_leg_id={winner_leg_id} "
+            f"call_log={call_log_name}: {frappe.get_traceback()}",
+        )
+        if call_log_name:
+            frappe.db.set_value("CRM Call Log", call_log_name, "status", "Failed")
+            frappe.db.set_value("CRM Call Log", call_log_name, "end_time", frappe.utils.now_datetime())
+            frappe.db.commit()
+        frappe.cache().delete_value(_ring_group_cache_key(customer_call_id))
+        return
+
+    _start_recording(customer_call_id, call_log_name, agent_user)
 
     if call_log_name:
         frappe.db.set_value("CRM Call Log", call_log_name, "status", "In Progress")
         frappe.db.commit()
+
+    # TEMPORARY DEBUG LOGGING - remove once the inbound answered/No-Answer flow is confirmed working
+    frappe.log_error(
+        "Telnyx Ring Group Bridge",
+        f"bridge succeeded customer_call_id={customer_call_id} winner_leg_id={winner_leg_id} "
+        f"call_log={call_log_name} - status set to In Progress, recording started",
+    )
 
     frappe.cache().delete_value(_ring_group_cache_key(customer_call_id))
 
@@ -641,7 +762,18 @@ def _ring_group_agent_hangup(agent_leg_id, state, call_log_name):
     cache_key = _ring_group_cache_key(customer_call_id)
     ring_group = frappe.cache().get_value(cache_key)
 
+    # TEMPORARY DEBUG LOGGING - remove once the inbound answered/No-Answer flow is confirmed working
+    frappe.log_error(
+        "Telnyx Ring Group Agent Hangup",
+        f"agent_leg_id={agent_leg_id} customer_call_id={customer_call_id} call_log={call_log_name} "
+        f"ring_group_found={bool(ring_group)} winner={ring_group.get('winner') if ring_group else None} "
+        f"agent_legs_remaining={list(ring_group.get('agent_legs', {}).keys()) if ring_group else None}",
+    )
+
     if not ring_group:
+        # Cache is gone - normally means it already bridged successfully and
+        # this is the real, post-conversation hangup. Hand off to the
+        # ordinary end-of-call handling rather than treating it as No Answer.
         _call_ended(agent_leg_id, state.get("leg"), state, call_log_name)
         return
 
@@ -658,6 +790,11 @@ def _ring_group_agent_hangup(agent_leg_id, state, call_log_name):
         return
 
     # Every agent leg declined or timed out - nobody answered.
+    frappe.log_error(
+        "Telnyx Ring Group Agent Hangup",
+        f"customer_call_id={customer_call_id} call_log={call_log_name} - "
+        f"every agent leg is gone with no winner - marking No Answer",
+    )
     frappe.cache().delete_value(cache_key)
     _post(f"/calls/{customer_call_id}/actions/hangup", {})
     if call_log_name:
@@ -669,6 +806,15 @@ def _ring_group_agent_hangup(agent_leg_id, state, call_log_name):
 def _ring_group_customer_hangup(customer_call_id, ring_group):
     """The customer abandoned the call before any agent answered."""
     call_log_name = ring_group.get("call_log")
+
+    # TEMPORARY DEBUG LOGGING - remove once the inbound answered/No-Answer flow is confirmed working.
+    # If "winner" shows up set here, that's a real bug: it means a call
+    # already claimed by an agent is being treated as abandoned-before-answer.
+    frappe.log_error(
+        "Telnyx Ring Group Customer Hangup",
+        f"customer_call_id={customer_call_id} call_log={call_log_name} "
+        f"winner={ring_group.get('winner')} agent_legs={list(ring_group.get('agent_legs', {}).keys())}",
+    )
 
     for leg_id in ring_group.get("agent_legs", {}):
         _post(f"/calls/{leg_id}/actions/hangup", {})
