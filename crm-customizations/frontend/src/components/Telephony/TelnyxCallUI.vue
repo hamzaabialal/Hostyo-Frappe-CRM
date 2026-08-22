@@ -434,11 +434,16 @@ function declineCall() {
 
 function onTelnyxCallEvent(data) {
   // TEMPORARY DEBUG LOGGING - remove once the ringtone stop-on-answer bug is
-  // confirmed fixed. This is the ONLY signal that stops the outbound
-  // ringtone once the lead answers (leg B's call.answered) - if this log
-  // never appears with leg==='B' on a live call where the lead genuinely
-  // picked up, the socket event itself is the problem, not the audio code.
-  console.log(`[${ts()}] [${instanceId}] TELNYX EVENT RECEIVED event=${data?.event} leg=${data?.leg} status=${data?.status}`, data)
+  // confirmed fixed. Full raw payload, stringified so it's never collapsed/
+  // missed in the console - this is the ONLY signal that stops the outbound
+  // ringtone once the lead answers (leg B's call.answered). If this log
+  // never appears at all during a live call where the lead genuinely picked
+  // up, the socket never delivered anything - a transport problem (check the
+  // SOCKET CONNECT/DISCONNECT/CONNECT_ERROR logs below), not a payload one.
+  // If it appears but with a different event/leg than expected, *that*
+  // would be a real payload mismatch - but compare against what's actually
+  // logged, not assumed.
+  console.log(`[${ts()}] [${instanceId}] TELNYX EVENT RECEIVED raw=${JSON.stringify(data)}`)
   if (!data) return
   visible.value = true
   if (data.to) {
@@ -461,6 +466,30 @@ function onTelnyxCallEvent(data) {
   }
 }
 
+// TEMPORARY DEBUG LOGGING - remove once the ringtone stop-on-answer bug is
+// confirmed fixed. The one-time "socket connected?" check at mount only
+// captures a snapshot at page-load - it says nothing about whether the
+// socket is still connected (or ever became connected) by the time an event
+// needs to arrive, seconds or minutes later, which is exactly what matters
+// here. These log on every actual connect/disconnect/error the underlying
+// socket.io-client emits, so a test call's console shows definitively
+// whether the transport was ever up during that call, not just at page load.
+function logSocketState(label) {
+  console.log(
+    `[${ts()}] [${instanceId}] SOCKET ${label} connected=${$socket?.connected} id=${$socket?.id}`,
+  )
+}
+
+function onSocketConnect() {
+  logSocketState('CONNECT')
+}
+function onSocketDisconnect(reason) {
+  console.log(`[${ts()}] [${instanceId}] SOCKET DISCONNECT reason=${reason}`)
+}
+function onSocketConnectError(err) {
+  console.log(`[${ts()}] [${instanceId}] SOCKET CONNECT_ERROR message=${err?.message}`, err)
+}
+
 onMounted(() => {
   // TEMPORARY DEBUG LOGGING - remove once the ringtone stop-on-answer bug is
   // confirmed fixed. If TWO different instanceIds ever appear in the console
@@ -470,8 +499,10 @@ onMounted(() => {
   // another instance is the one still playing it.
   console.error(`[${ts()}] [${instanceId}] TELNYX MOUNT TEST - this component IS mounting`)
   setupClient()
-  console.log('TELNYX DEBUG - socket instance:', $socket)
-  console.log('TELNYX DEBUG - socket connected?:', $socket?.connected)
+  logSocketState('MOUNT SNAPSHOT')
+  $socket.on('connect', onSocketConnect)
+  $socket.on('disconnect', onSocketDisconnect)
+  $socket.on('connect_error', onSocketConnectError)
   $socket.on('telnyx_call_event', onTelnyxCallEvent)
   console.log('TELNYX DEBUG - listener registered')
 })
@@ -480,6 +511,9 @@ onBeforeUnmount(() => {
   if (client.value) {
     client.value.disconnect()
   }
+  $socket.off('connect', onSocketConnect)
+  $socket.off('disconnect', onSocketDisconnect)
+  $socket.off('connect_error', onSocketConnectError)
   $socket.off('telnyx_call_event', onTelnyxCallEvent)
   stopTimer()
   stopRingtone('unmount')
