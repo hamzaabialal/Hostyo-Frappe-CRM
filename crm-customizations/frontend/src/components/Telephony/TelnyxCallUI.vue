@@ -319,13 +319,22 @@ async function setupClient() {
         remoteAudioEl.value.play().catch((e) => console.error('Telnyx: audio play failed', e))
       }
 
-      if (callDirection.value === 'outbound') {
+      if (callDirection.value === 'outbound' && status.value !== 'active') {
         // Our own leg just connected - Telnyx now dials the lead (leg B)
         // server-side. Stay off 'active'/the timer, and play the ringtone,
         // until leg B actually answers (telnyx_call_event, handled below).
+        //
+        // Guarded on status !== 'active': Telnyx's WebRTC client can re-fire
+        // this same 'active' notification on leg A later (e.g. a mid-call
+        // renegotiation once the server-side bridge to the lead completes).
+        // Without the guard, that second firing would unconditionally redo
+        // this branch - flipping back to 'dialing' and restarting the
+        // ringtone - even though the lead already answered. Nothing would
+        // stop it a second time, since the telnyx_call_event for leg B's
+        // call.answered only ever fires once.
         status.value = 'dialing'
         playRingtone()
-      } else {
+      } else if (callDirection.value !== 'outbound') {
         status.value = 'active'
         startTimer()
       }
