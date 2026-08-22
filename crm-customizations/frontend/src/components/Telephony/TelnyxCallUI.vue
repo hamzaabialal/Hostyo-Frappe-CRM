@@ -94,6 +94,13 @@ const gStore = globalStore()
 const { $socket } = gStore
 const router = useRouter()
 
+// TEMPORARY DEBUG LOGGING - remove once the ringtone stop-on-answer bug is
+// confirmed fixed. Tags every log this instance emits, so two accidental
+// mounts of this component (which would each run their own independent
+// ringtone/WebRTC/socket logic) show up as clearly distinct in the console
+// instead of looking like one instance behaving inconsistently.
+const instanceId = Math.random().toString(36).slice(2, 8)
+
 const client = ref(null)
 const remoteAudioEl = ref(null)
 const activeCall = ref(null)
@@ -183,30 +190,61 @@ function stopTimer() {
 }
 
 // Generated tone (no external audio file, so nothing to license) - a classic
-// two-beep ring cadence, repeating every 2s while an inbound call is ringing.
+// two-beep ring cadence, repeating every 2s while a call is ringing/dialing.
+//
+// This is NOT "play one tone and let it finish" - it's a recursive schedule:
+// setInterval re-invokes ringOnce() every 2s, and each invocation itself
+// schedules two Web Audio oscillators ahead of time on the AudioContext's
+// own timeline (osc.start/stop at now+offset). Stopping it correctly means
+// two distinct things, not one:
+//   1. Cancel *future* setInterval ticks - clearInterval.
+//   2. Make sure a tick that's already been dispatched (queued on the JS
+//      event loop a moment before stopRingtone() runs) can't produce sound
+//      either, and that closing the AudioContext actually lands before any
+//      oscillator already scheduled on it fires.
+// The token below covers both: every scheduled tick checks it's still the
+// current generation *before* touching the audio graph, so a stale tick is
+// always a no-op - independent of timing, of what triggered the stop, or of
+// whether clearInterval/close() alone would have been enough on their own.
 let ringtoneCtx = null
 let ringtoneHandle = null
+let ringtoneToken = 0
 
-function playRingtone() {
-  stopRingtone()
+// TEMPORARY DEBUG LOGGING - remove once the ringtone stop-on-answer bug is
+// confirmed fixed against a real test call. Timestamped so start/stop calls
+// can be correlated against the WebRTC and telnyx_call_event logs below.
+const ts = () => new Date().toISOString()
+
+function playRingtone(source) {
+  stopRingtone(`superseded-by:${source}`)
   const AudioCtx = window.AudioContext || window.webkitAudioContext
   if (!AudioCtx) return
-  ringtoneCtx = new AudioCtx()
-  ringtoneCtx.resume?.().catch(() => {})
+
+  const myToken = ++ringtoneToken
+  const ctx = new AudioCtx()
+  ringtoneCtx = ctx
+  ctx.resume?.().catch(() => {})
+
+  console.log(`[${ts()}] [${instanceId}] RINGTONE PLAY token=${myToken} source=${source}`)
 
   const ringOnce = () => {
-    if (!ringtoneCtx) return
-    const now = ringtoneCtx.currentTime
+    // Stale-tick guard - see comment above. Covers both "stopRingtone already
+    // ran" and "a newer playRingtone already superseded this one".
+    if (myToken !== ringtoneToken || ctx !== ringtoneCtx) {
+      console.log(`[${ts()}] [${instanceId}] RINGTONE TICK SKIPPED (stale) token=${myToken} currentToken=${ringtoneToken}`)
+      return
+    }
+    const now = ctx.currentTime
     ;[0, 0.4].forEach((offset) => {
-      const osc = ringtoneCtx.createOscillator()
-      const gain = ringtoneCtx.createGain()
+      const osc = ctx.createOscillator()
+      const gain = ctx.createGain()
       osc.frequency.value = 440
       gain.gain.setValueAtTime(0, now + offset)
       gain.gain.linearRampToValueAtTime(0.15, now + offset + 0.02)
       gain.gain.setValueAtTime(0.15, now + offset + 0.35)
       gain.gain.linearRampToValueAtTime(0, now + offset + 0.4)
       osc.connect(gain)
-      gain.connect(ringtoneCtx.destination)
+      gain.connect(ctx.destination)
       osc.start(now + offset)
       osc.stop(now + offset + 0.4)
     })
@@ -216,14 +254,18 @@ function playRingtone() {
   ringtoneHandle = setInterval(ringOnce, 2000)
 }
 
-function stopRingtone() {
+function stopRingtone(source) {
+  const wasPlaying = !!ringtoneCtx
+  ringtoneToken++ // invalidate any tick already queued/dispatched before this line, immediately
+  console.log(`[${ts()}] [${instanceId}] RINGTONE STOP source=${source} wasPlaying=${wasPlaying} newToken=${ringtoneToken}`)
   if (ringtoneHandle) {
     clearInterval(ringtoneHandle)
     ringtoneHandle = null
   }
   if (ringtoneCtx) {
-    ringtoneCtx.close().catch(() => {})
+    const ctx = ringtoneCtx
     ringtoneCtx = null
+    ctx.close().catch(() => {})
   }
 }
 
@@ -241,7 +283,7 @@ function endCall(reason) {
   isMuted.value = false
   isHeld.value = false
   stopTimer()
-  stopRingtone()
+  stopRingtone(`endCall:${reason}`)
 
   // Give the agent a moment longer to actually read "No Answer" before the
   // dock disappears, versus the brief flash for a normal call ending.
@@ -284,6 +326,12 @@ async function setupClient() {
     const call = notification.call
     if (!call) return
 
+    // TEMPORARY DEBUG LOGGING - remove once the ringtone stop-on-answer bug
+    // is confirmed fixed. Correlate against the RINGTONE PLAY/STOP and
+    // TELNYX EVENT RECEIVED logs by timestamp to see the real order events
+    // arrive in on a live call.
+    console.log(`[${ts()}] [${instanceId}] WEBRTC call.state=${call.state} direction=${callDirection.value} status=${status.value}`)
+
     if (call.state === 'ringing') {
       activeCall.value = call
       visible.value = true
@@ -298,7 +346,7 @@ async function setupClient() {
         leadNumber.value = call.options?.remoteCallerNumber || ''
         leadName.value = call.options?.remoteCallerName || ''
         setReference(null, null) // filled in by the telnyx_call_event socket update, if it matches a lead
-        playRingtone()
+        playRingtone('inbound-ringing')
       } else {
         // Outbound click-to-call: this is our own softphone leg ringing back
         // to us, so auto-answer it exactly like before. It connects almost
@@ -313,7 +361,7 @@ async function setupClient() {
         call.answer()
       }
     } else if (call.state === 'active') {
-      stopRingtone()
+      stopRingtone('webrtc-active-event')
       if (remoteAudioEl.value && call.remoteStream) {
         remoteAudioEl.value.srcObject = call.remoteStream
         remoteAudioEl.value.play().catch((e) => console.error('Telnyx: audio play failed', e))
@@ -333,7 +381,7 @@ async function setupClient() {
         // stop it a second time, since the telnyx_call_event for leg B's
         // call.answered only ever fires once.
         status.value = 'dialing'
-        playRingtone()
+        playRingtone('outbound-leg-a-active')
       } else if (callDirection.value !== 'outbound') {
         status.value = 'active'
         startTimer()
@@ -373,19 +421,24 @@ function hangup() {
 
 function answerCall() {
   if (!activeCall.value) return
-  stopRingtone()
+  stopRingtone('answerCall')
   activeCall.value.answer()
   status.value = 'connecting'
 }
 
 function declineCall() {
   if (!activeCall.value) return
-  stopRingtone()
+  stopRingtone('declineCall')
   activeCall.value.hangup()
 }
 
 function onTelnyxCallEvent(data) {
-  console.log('TELNYX EVENT RECEIVED:', data)
+  // TEMPORARY DEBUG LOGGING - remove once the ringtone stop-on-answer bug is
+  // confirmed fixed. This is the ONLY signal that stops the outbound
+  // ringtone once the lead answers (leg B's call.answered) - if this log
+  // never appears with leg==='B' on a live call where the lead genuinely
+  // picked up, the socket event itself is the problem, not the audio code.
+  console.log(`[${ts()}] [${instanceId}] TELNYX EVENT RECEIVED event=${data?.event} leg=${data?.leg} status=${data?.status}`, data)
   if (!data) return
   visible.value = true
   if (data.to) {
@@ -399,7 +452,7 @@ function onTelnyxCallEvent(data) {
   }
   if (data.event === 'call.answered' && data.leg === 'B') {
     // The lead just picked up - this is the real start of the conversation.
-    stopRingtone()
+    stopRingtone('socket:leg-B-answered')
     status.value = 'active'
     startTimer()
   }
@@ -409,7 +462,13 @@ function onTelnyxCallEvent(data) {
 }
 
 onMounted(() => {
-  console.error('TELNYX MOUNT TEST - this component IS mounting')
+  // TEMPORARY DEBUG LOGGING - remove once the ringtone stop-on-answer bug is
+  // confirmed fixed. If TWO different instanceIds ever appear in the console
+  // for what should be a single dock, this component is mounted more than
+  // once - each copy runs its own independent WebRTC client/ringtone/socket
+  // listener, which would explain a ringtone one instance can't stop because
+  // another instance is the one still playing it.
+  console.error(`[${ts()}] [${instanceId}] TELNYX MOUNT TEST - this component IS mounting`)
   setupClient()
   console.log('TELNYX DEBUG - socket instance:', $socket)
   console.log('TELNYX DEBUG - socket connected?:', $socket?.connected)
@@ -423,7 +482,7 @@ onBeforeUnmount(() => {
   }
   $socket.off('telnyx_call_event', onTelnyxCallEvent)
   stopTimer()
-  stopRingtone()
+  stopRingtone('unmount')
 })
 </script>
 
