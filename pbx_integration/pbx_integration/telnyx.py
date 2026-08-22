@@ -299,7 +299,11 @@ def handle_telnyx_webhook():
     except Exception:
         frappe.log_error("Telnyx Webhook CRASH", frappe.get_traceback())
 
-    if call_log_name and state.get("agent_user"):
+    # call.answered/leg B is published explicitly inside _lead_answered
+    # itself now, not through this generic path - see the comment there for
+    # why. Skip it here so the frontend doesn't get the same "lead answered"
+    # signal twice (which would reset its call-duration timer a second time).
+    if call_log_name and state.get("agent_user") and not (event_type == "call.answered" and leg == "B"):
         to_number, call_status, ref_doctype, ref_name = frappe.db.get_value(
             "CRM Call Log", call_log_name, ["to", "status", "reference_doctype", "reference_docname"]
         )
@@ -388,6 +392,43 @@ def _lead_answered(leg_b_id, state, call_log_name):
     if call_log_name:
         frappe.db.set_value("CRM Call Log", call_log_name, "status", "In Progress")
         frappe.db.commit()
+
+    # Publish "the lead answered" directly here, with everything already in
+    # hand, instead of relying solely on the generic catch-all at the bottom
+    # of handle_telnyx_webhook. A live call (call_log 79054ad6e8d7) showed
+    # that generic path can silently fail to publish this one event even
+    # though _lead_answered ran successfully end to end (bridge + recording
+    # both happened, the call log reached Completed) - so whatever caused
+    # that, this signal no longer depends on it. This is the ONLY event
+    # TelnyxCallUI.vue listens for to stop the outbound ringtone and flip to
+    # "On Call" - it needs to be unconditionally reliable.
+    agent_user = state.get("agent_user")
+    if call_log_name and agent_user:
+        to_number, ref_doctype, ref_name = frappe.db.get_value(
+            "CRM Call Log", call_log_name, ["to", "reference_doctype", "reference_docname"]
+        )
+        lead_name = _display_name_for_reference(ref_doctype, ref_name)
+        # TEMPORARY DEBUG LOGGING - remove once this is confirmed reliable
+        frappe.log_error(
+            "Telnyx Realtime Publish",
+            f"event=call.answered leg=B (explicit, from _lead_answered) call_log={call_log_name} "
+            f"agent_user={agent_user} to={to_number} reference={ref_doctype}/{ref_name} lead_name={lead_name!r}",
+        )
+        frappe.publish_realtime(
+            "telnyx_call_event",
+            {
+                "event": "call.answered",
+                "leg": "B",
+                "call_log": call_log_name,
+                "call_control_id": leg_b_id,
+                "to": to_number,
+                "status": "In Progress",
+                "lead_name": lead_name,
+                "reference_doctype": ref_doctype,
+                "reference_docname": ref_name,
+            },
+            user=agent_user,
+        )
 
 
 def _lead_hangup(leg_b_id, state, call_log_name):
