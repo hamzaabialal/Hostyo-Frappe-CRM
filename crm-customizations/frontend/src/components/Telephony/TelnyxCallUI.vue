@@ -445,7 +445,17 @@ function onTelnyxCallEvent(data) {
   // logged, not assumed.
   console.log(`[${ts()}] [${instanceId}] TELNYX EVENT RECEIVED raw=${JSON.stringify(data)}`)
   if (!data) return
-  visible.value = true
+  // The dock is always opened first by the WebRTC 'ringing' notification
+  // (for both inbound and outbound calls), before any backend socket event
+  // for that call can arrive - so this handler never needs to *open* it,
+  // only update an already-visible call. Without this guard, a trailing
+  // event that lands after the call has already ended and the dock has
+  // already auto-hidden (e.g. call.hangup for the recording leg, or
+  // call.recording.saved, both of which finish processing seconds after the
+  // agent's own leg hangs up) would flip visible back to true and resurrect
+  // the dock stuck showing "Idle" - since only call.hangup schedules the
+  // auto-hide, so nothing would ever hide it again.
+  if (!visible.value) return
   if (data.to) {
     leadNumber.value = data.to
   }
