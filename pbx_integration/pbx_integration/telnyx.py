@@ -49,6 +49,17 @@ def _caller_id():
     return cid
 
 
+def _agent_caller_id(user):
+    """Per-agent outbound caller ID: the agent's own telnyx_did if set,
+    otherwise the site-wide fallback. Deliberately reuses telnyx_did rather
+    than a new field - the same number then works in both directions, so a
+    customer calling back reaches the same agent who called them (see
+    _agents_for_inbound_number, which routes inbound calls the same way).
+    """
+    did = frappe.db.get_value("User", user, "telnyx_did")
+    return did or _caller_id()
+
+
 def _sip_domain():
     return frappe.conf.get("telnyx_sip_domain") or "sip.telnyx.com"
 
@@ -165,11 +176,12 @@ def create_click2call(to, reference_doctype=None, reference_name=None):
 
     agent_user = frappe.session.user
     sip_username = _agent_sip_username(agent_user)
+    caller_id = _agent_caller_id(agent_user)
 
     call_log = frappe.get_doc(
         {
             "doctype": "CRM Call Log",
-            "from": sip_username,
+            "from": caller_id,
             "to": to,
             "type": "Outgoing",
             "status": "Initiated",
@@ -199,7 +211,7 @@ def create_click2call(to, reference_doctype=None, reference_name=None):
         {
             "connection_id": _connection_id(),
             "to": f"sip:{sip_username}@{_sip_domain()}",
-            "from": _caller_id(),
+            "from": caller_id,
             "client_state": client_state,
             "custom_headers": [{"name": "X-Call-Direction", "value": "outbound"}],
         },
@@ -324,7 +336,7 @@ def handle_telnyx_webhook():
                 "event": event_type,
                 "leg": leg,
                 "call_log": call_log_name,
-                "call_control_id": call_control_id,
+                "call_control_id": call_control_id,       
                 "to": to_number,
                 "status": call_status,
                 "lead_name": lead_name,
@@ -363,7 +375,7 @@ def _agent_answered(leg_a_id, state, call_log_name):
         {
             "connection_id": _connection_id(),
             "to": destination,
-            "from": _caller_id(),
+            "from": _agent_caller_id(agent_user),
             "client_state": leg_b_state,
             "timeout_secs": RING_TIMEOUT_SECS,
         },
@@ -724,6 +736,34 @@ def _agents_for_inbound_number(our_number):
         f"ringing all {len(all_agents)} agent(s) with a pbx_extension",
     )
     return all_agents
+
+
+def validate_unique_telnyx_did(doc, method=None):
+    """Block the same telnyx_did being assigned to two enabled users -
+    _agents_for_inbound_number assumes at most one enabled agent owns a given
+    DID, so a duplicate would make inbound routing for that number ambiguous.
+    Same digits-only comparison as _agents_for_inbound_number, since
+    formatting rarely matches exactly.
+    """
+    if not doc.telnyx_did or not doc.enabled:
+        return
+
+    normalized = _normalize_phone(doc.telnyx_did)
+    if not normalized:
+        return
+
+    other_agents = frappe.get_all(
+        "User",
+        filters={"telnyx_did": ["is", "set"], "enabled": 1, "name": ["!=", doc.name]},
+        fields=["name", "telnyx_did"],
+    )
+    for other in other_agents:
+        if _normalize_phone(other.telnyx_did) == normalized:
+            frappe.throw(
+                _("Telnyx number {0} is already assigned to another agent ({1}).").format(
+                    doc.telnyx_did, other.name
+                )
+            )
 
 
 def _start_ring_group(call_control_id, payload):

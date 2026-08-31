@@ -251,5 +251,8 @@ app_license = "mit"
 doc_events = {
 	"Email Queue": {
 		"after_insert": "pbx_integration.email_utils.flush_email_immediately"
+	},
+	"User": {
+		"validate": "pbx_integration.telnyx.validate_unique_telnyx_did"
 	}
 }
