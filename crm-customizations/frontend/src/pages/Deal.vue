@@ -381,6 +381,8 @@ import { useDocument } from '@/data/document'
 import { whatsappEnabled } from '@/composables/whatsapp'
 import { smsEnabled } from '@/composables/sms'
 import SMSIcon from '@/components/Icons/SMSIcon.vue'
+import { meetingsEnabled } from '@/composables/meetings'
+import MeetingsIcon from '@/components/Icons/MeetingsIcon.vue'
 import { callEnabled } from '@/composables/telephony'
 import { useBroadcast } from '@/composables/useBroadcast'
 import {
@@ -608,6 +610,12 @@ const tabs = computed(() => {
       label: __('SMS'),
       icon: SMSIcon,
       condition: () => smsEnabled.value,
+    },
+    {
+      name: 'Meetings',
+      label: __('Meetings'),
+      icon: MeetingsIcon,
+      condition: () => meetingsEnabled.value,
     },
   ]
   return tabOptions.filter((tab) => (tab.condition ? tab.condition() : true))
