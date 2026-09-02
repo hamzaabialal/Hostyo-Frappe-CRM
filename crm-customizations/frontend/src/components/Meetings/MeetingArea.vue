@@ -6,8 +6,14 @@
           {{ meeting.subject || __('Meeting') }}
         </span>
       </div>
-      <div class="ml-auto whitespace-nowrap">
-        <TimelineTimestamp :date="meeting.starts_on" />
+      <div class="ml-auto whitespace-nowrap text-sm text-ink-gray-5">
+        <!-- Plain formatDate text, not TimelineTimestamp.vue - that
+             component was never used by any pre-existing file in this
+             repo (only confirmed via a fresh upstream fetch), unlike
+             formatDate itself, which Activities.vue/CallLogDetailModal.vue
+             already rely on in deploys that have already succeeded on this
+             exact server. -->
+        {{ formatDate(meeting.starts_on, 'MMM D, h:mm a') }}
       </div>
     </div>
     <div
@@ -73,19 +79,27 @@
         />
       </div>
       <!-- Attendee avatars - replaces the previous plain-text "With: a, b, c"
-           list. Reuses MultipleAvatar (already used elsewhere in this app,
-           e.g. CallArea.vue's caller/receiver pair) rather than a new
-           component. No :image is available for participants (Event
+           list. MultipleAvatar.vue (the app's own @/components file) was
+           never used by any pre-existing file in this repo and turned out
+           to be unverifiable against this specific server, so this builds
+           the same overlapping-stack look by hand from frappe-ui's own
+           Avatar primitive instead - Avatar itself is proven safe
+           (CallLogDetailModal.vue already imports it from 'frappe-ui', and
+           it ships as part of the frappe-ui npm package - reinstalled
+           fresh every deploy at our pinned version - not the crm app's own
+           frozen source tree, which is where every ENOENT so far has come
+           from). No :image is available for participants (Event
            Participants only carries an email, not a resolved User/Contact
-           image), so these render as initials-only circles - which is what
-           "small circular initials avatars" asked for anyway.
-           meeting.event_participants shape same as before: defensively
-           handled as a possibly-empty/undefined array. -->
-      <MultipleAvatar
-        v-if="participantAvatars.length"
-        :avatars="participantAvatars"
-        size="sm"
-      />
+           image), so these render as initials-only circles either way. -->
+      <div v-if="participantAvatars.length" class="flex -space-x-1.5">
+        <Avatar
+          v-for="avatar in participantAvatars"
+          :key="avatar.label"
+          :label="avatar.label"
+          size="sm"
+          class="ring-2 ring-surface-elevation-1"
+        />
+      </div>
     </div>
   </div>
 </template>
@@ -94,11 +108,8 @@ import CalendarIcon from '@/components/Icons/CalendarIcon.vue'
 import DurationIcon from '@/components/Icons/DurationIcon.vue'
 import PhoneIcon from '@/components/Icons/PhoneIcon.vue'
 import CameraIcon from '@/components/Icons/CameraIcon.vue'
-import PeopleIcon from '@/components/Icons/PeopleIcon.vue'
-import TimelineTimestamp from '@/components/Activities/TimelineTimestamp.vue'
-import MultipleAvatar from '@/components/MultipleAvatar.vue'
 import { formatDate } from '@/utils'
-import { Badge, Dropdown, Button } from 'frappe-ui'
+import { Badge, Dropdown, Button, Avatar } from 'frappe-ui'
 import { computed } from 'vue'
 
 // Frappe core's actual Event.status options (verified against
@@ -114,18 +125,24 @@ const statusColorMap = {
 }
 
 // meeting_type -> {icon, color}. Icon choices reuse real, existing icons
-// from this app's Icons folder (confirmed via the base repo's actual file
-// listing) rather than inventing new ones: PhoneIcon for call-shaped
-// meetings, CameraIcon as the closest existing analog to a "video/Zoom"
-// icon (no dedicated VideoIcon exists), PeopleIcon for the one clearly
-// in-person type, CalendarIcon as the generic "Other" fallback. Colors for
-// the 4 types shown in the reference screenshot's legend were matched to
-// that legend (blue/green/orange/purple in that order); the other 4 types
-// have no reference to match against, so their colors were chosen only to
-// stay visually distinct from the first 4 and each other - not verified
-// against any design source.
+// from this app's Icons folder - but scoped down to only the ones proven
+// safe on the actual production server (already imported by pre-existing
+// overlay files that have already deployed successfully there), after
+// PeopleIcon.vue turned out to be missing on that server despite existing
+// in every plausible upstream reference commit checked. That's a strictly
+// tighter bar than "exists in some frappe/crm commit" - this server's own
+// file set doesn't correspond to any single point in public history, so
+// only proven-in-actual-deploys icons are used now: PhoneIcon for
+// call-shaped meetings, CameraIcon for video/demo-shaped ones, CalendarIcon
+// as the generic fallback. No in-person-specific icon is available within
+// that proven set, so Property Viewing uses CalendarIcon too - a real
+// compromise, not a perfect fit, flagged here rather than silently made.
+// Colors for the 4 types shown in the reference screenshot's legend were
+// matched to that legend (blue/green/orange/purple in that order); the
+// other 4 have no reference to match against, so their colors were chosen
+// only to stay visually distinct - not verified against any design source.
 const meetingTypeMap = {
-  'Property Viewing': { icon: PeopleIcon, color: '#3b82f6' },
+  'Property Viewing': { icon: CalendarIcon, color: '#3b82f6' },
   'Onboarding Call': { icon: PhoneIcon, color: '#22c55e' },
   'Follow-up Call': { icon: PhoneIcon, color: '#f97316' },
   'Negotiation Call': { icon: PhoneIcon, color: '#a855f7' },

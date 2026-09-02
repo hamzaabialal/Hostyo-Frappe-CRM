@@ -1,7 +1,12 @@
 <template>
   <LayoutHeader>
     <template #left-header>
-      <ViewBreadcrumbs routeName="Meetings" />
+      <!-- Plain heading, not ViewBreadcrumbs.vue - that component was only
+           ever confirmed via fetching Calendar.vue (a file now known to be
+           missing on the actual production server), never against any
+           pre-existing, already-successfully-deployed file in this repo.
+           Matches MeetingsListView.vue's own header text/style exactly. -->
+      <div class="text-lg font-semibold text-ink-gray-9">{{ __('Meetings') }}</div>
     </template>
   </LayoutHeader>
   <div class="flex flex-1 flex-col overflow-hidden">
@@ -30,7 +35,6 @@
 </template>
 <script setup>
 import LayoutHeader from '@/components/LayoutHeader.vue'
-import ViewBreadcrumbs from '@/components/ViewBreadcrumbs.vue'
 import MeetingsListView from '@/components/Meetings/MeetingsListView.vue'
 import MeetingsCalendarView from '@/components/Meetings/MeetingsCalendarView.vue'
 import { Button } from 'frappe-ui'
