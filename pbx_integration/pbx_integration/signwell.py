@@ -150,20 +150,41 @@ def send_contract(deal_name, language):
 		frappe.throw(_("SignWell did not return a document id: {0}").format(data))
 
 	# Persist signwell_document_id via db.set_value (not part of the same
-	# save() as the status change below) and mirror it onto the in-memory
-	# doc so save()'s own before/after diff sees no change for this field.
-	# CRM Deal has track_changes=1, and the activity timeline
-	# (crm.api.activities.get_deal_activities) only ever renders the FIRST
-	# entry of each Version's "changed" list - if both fields changed in
-	# the same save(), the status change (the one that actually matters
-	# for the timeline) could silently lose that race depending on field
-	# order. Keeping this as its own write guarantees the status save()
-	# below produces a Version whose only changed field is "status".
+	# save() as the status change below). CRM Deal has track_changes=1, and
+	# the activity timeline (crm.api.activities.get_deal_activities) only
+	# ever renders the FIRST entry of each Version's "changed" list - if
+	# both fields changed in the same save(), the status change (the one
+	# that actually matters for the timeline) could silently lose that race
+	# depending on field order. Keeping this as its own write guarantees
+	# the status save() below produces a Version whose only changed field
+	# is "status".
+	#
+	# set_value bumps the row's `modified` timestamp in the DB, but leaves
+	# the in-memory `deal` object holding the old one - saving it as-is
+	# would raise TimestampMismatchError ("Document has been modified after
+	# you have opened it"). reload() resyncs the whole doc (including the
+	# document id just written) from the DB, so save() below diffs cleanly
+	# against current DB state and only "status" comes out changed.
 	frappe.db.set_value("CRM Deal", deal.name, "signwell_document_id", document_id)
-	deal.signwell_document_id = document_id
+	deal.reload()
 
 	deal.status = contract_sent_status
-	deal.save()
+	try:
+		deal.save()
+	except Exception:
+		# The contract is already sent and signwell_document_id is already
+		# stored - if the status update itself now fails, that must never
+		# look like a silent success. A caller who sees no error might retry
+		# send_contract, which would send a SECOND contract to the customer.
+		# Log loudly with the document id for manual follow-up, then
+		# re-raise so the caller gets a clear failure, not a false "sent".
+		frappe.log_error(
+			"SignWell Contract Status Update Failed",
+			f"Deal {deal.name}: contract already sent (signwell_document_id={document_id}) "
+			f"but the status update to {contract_sent_status!r} failed. Fix the deal's status "
+			f"manually - do NOT call send_contract again for this deal.\n{frappe.get_traceback()}",
+		)
+		raise
 
 	return {"status": "sent", "document_id": document_id, "deal": deal.name}
 
