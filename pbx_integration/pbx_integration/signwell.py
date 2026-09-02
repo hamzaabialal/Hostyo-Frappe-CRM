@@ -171,6 +171,18 @@ def send_contract(deal_name, language):
 	deal.status = contract_sent_status
 	try:
 		deal.save()
+		# save() only queues the write in the *current* DB transaction - it
+		# does not by itself guarantee the row is durable. A normal
+		# whitelisted call over HTTP gets an implicit commit at the end of
+		# the request, but calling send_contract directly (e.g. from bench
+		# console, which is how this was tested) does not: without an
+		# explicit commit, the write sits open on that connection - visible
+		# to that same connection's own later reads (which is exactly what
+		# made frappe.get_doc() show "Contract Sent" right after), but never
+		# actually landing in the table, and gone entirely once the console
+		# session ends. Commit explicitly so persistence never depends on
+		# who's calling this.
+		frappe.db.commit()
 	except Exception:
 		# The contract is already sent and signwell_document_id is already
 		# stored - if the status update itself now fails, that must never
@@ -185,6 +197,27 @@ def send_contract(deal_name, language):
 			f"manually - do NOT call send_contract again for this deal.\n{frappe.get_traceback()}",
 		)
 		raise
+
+	# Prove the commit actually landed by reading the row straight back with
+	# a real SELECT (frappe.db.get_value with no cache arg - not get_doc,
+	# not get_cached_doc, and not the in-memory `deal` object, all of which
+	# can show a value that was never actually persisted). If this doesn't
+	# match, the contract has still gone out with the deal's status
+	# unconfirmed - that has to surface as a failure, not a quiet "sent".
+	persisted_status = frappe.db.get_value("CRM Deal", deal.name, "status")
+	if persisted_status != contract_sent_status:
+		frappe.log_error(
+			"SignWell Contract Status Update Failed",
+			f"Deal {deal.name}: contract already sent (signwell_document_id={document_id}) "
+			f"but tabCRM Deal still shows status={persisted_status!r} after save()+commit(). "
+			f"Fix the deal's status manually - do NOT call send_contract again for this deal.",
+		)
+		frappe.throw(
+			_(
+				"The contract was sent, but the deal status update could not be confirmed. "
+				"Check the deal manually before sending another contract."
+			)
+		)
 
 	return {"status": "sent", "document_id": document_id, "deal": deal.name}
 
@@ -242,6 +275,11 @@ def _mark_deal_won(document_id):
 
 	deal.status = won_status
 	deal.save(ignore_permissions=True)
+	# Same reasoning as send_contract: don't leave this write's durability
+	# implicit. The webhook is always invoked over HTTP in production (which
+	# would auto-commit anyway), but committing explicitly here costs
+	# nothing and removes any doubt.
+	frappe.db.commit()
 
 
 @frappe.whitelist(allow_guest=True)
