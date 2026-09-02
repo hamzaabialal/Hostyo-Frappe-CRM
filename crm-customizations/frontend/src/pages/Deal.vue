@@ -116,6 +116,10 @@
               @click="showFilesUploader = true"
             />
 
+            <Dropdown :options="contractOptions" placement="bottom-start">
+              <Button :tooltip="__('Send Contract')" icon="file-text" :disabled="sendingContract" />
+            </Dropdown>
+
             <Button
               v-if="canDelete"
               :tooltip="__('Delete')"
@@ -744,6 +748,38 @@ function triggerCall() {
   }
 
   makeCall(mobile_no)
+}
+
+const sendingContract = ref(false)
+
+const contractOptions = computed(() => [
+  {
+    label: __('English Contract'),
+    onClick: () => sendContract('en'),
+  },
+  {
+    label: __('Greek Contract'),
+    onClick: () => sendContract('gr'),
+  },
+])
+
+function sendContract(language) {
+  if (sendingContract.value) return
+  sendingContract.value = true
+
+  call('pbx_integration.signwell.send_contract', {
+    deal_name: props.dealId,
+    language,
+  })
+    .then(() => {
+      toast.success(__('Contract sent'))
+    })
+    .catch((e) => {
+      toast.error(e.messages?.[0] || __('Failed to send contract'))
+    })
+    .finally(() => {
+      sendingContract.value = false
+    })
 }
 
 async function triggerStatusChange(value) {
