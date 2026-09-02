@@ -106,20 +106,6 @@ def _agent_sip_username(user):
     return username
 
 
-def _agent_caller_id(user):
-    """Outbound caller ID for this agent: their own telnyx_did if set,
-    otherwise the shared site-wide caller ID (_caller_id()). Reusing
-    telnyx_did - the same field inbound routing keys off in
-    _agents_for_inbound_number - means a customer who calls that number
-    back reaches the same agent.
-    """
-    if user:
-        did = frappe.db.get_value("User", user, "telnyx_did")
-        if did:
-            return did
-    return _caller_id()
-
-
 def _ring_group_cache_key(customer_call_id):
     return f"telnyx_ring_group:{customer_call_id}"
 
@@ -750,34 +736,6 @@ def _agents_for_inbound_number(our_number):
         f"ringing all {len(all_agents)} agent(s) with a pbx_extension",
     )
     return all_agents
-
-
-def validate_unique_telnyx_did(doc, method=None):
-    """Block the same telnyx_did being assigned to two enabled users -
-    _agents_for_inbound_number assumes at most one enabled agent owns a given
-    DID, so a duplicate would make inbound routing for that number ambiguous.
-    Same digits-only comparison as _agents_for_inbound_number, since
-    formatting rarely matches exactly.
-    """
-    if not doc.telnyx_did or not doc.enabled:
-        return
-
-    normalized = _normalize_phone(doc.telnyx_did)
-    if not normalized:
-        return
-
-    other_agents = frappe.get_all(
-        "User",
-        filters={"telnyx_did": ["is", "set"], "enabled": 1, "name": ["!=", doc.name]},
-        fields=["name", "telnyx_did"],
-    )
-    for other in other_agents:
-        if _normalize_phone(other.telnyx_did) == normalized:
-            frappe.throw(
-                _("Telnyx number {0} is already assigned to another agent ({1}).").format(
-                    doc.telnyx_did, other.name
-                )
-            )
 
 
 def _start_ring_group(call_control_id, payload):
