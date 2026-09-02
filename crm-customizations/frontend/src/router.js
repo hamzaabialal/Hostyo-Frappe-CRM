@@ -1,25 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { call } from 'frappe-ui'
 import { usersStore } from '@/stores/users'
 import { sessionStore } from '@/stores/session'
 import { viewsStore } from '@/stores/views'
-
-let personaChecked = false
-export const PERSONA_DONE_KEY = 'crm_persona_captured'
-
-async function shouldCapturePersona() {
-  // Client-side flag guards against re-prompting if the server persist failed.
-  if (localStorage.getItem(PERSONA_DONE_KEY)) return false
-  const captured = await call('frappe.client.get_single_value', {
-    doctype: 'FCRM Settings',
-    field: 'persona_captured',
-  })
-  if (captured) return false
-  // The wizard only feeds telemetry; skip it entirely if the user opted out.
-  const { enabled } =
-    (await call('frappe.utils.telemetry.pulse.client.boot_config')) || {}
-  return !!enabled
-}
 
 const routes = [
   {
@@ -103,24 +85,44 @@ const routes = [
     component: () => import('@/pages/CallLogs.vue'),
   },
   {
-    path: '/calendar',
-    name: 'Calendar',
-    component: () => import('@/pages/Calendar.vue'),
-  },
-  {
     // Hostyo customization: top-level "Meetings" sidebar section (CRM
-    // meetings booked via frappe_appointment, linked to Leads/Deals) -
-    // distinct from the stock /calendar route above, which is a personal
-    // Event calendar scoped to the current user's own ownership/
-    // participation, not CRM-reference-linked meetings specifically. Kept
-    // deliberately simple - no alias, no :viewType, not added to any of the
-    // beforeEach guard's special-casing below - because those all exist to
-    // drive the doctype-backed saved-view system (ViewControls, standard
-    // list/kanban/group_by views, a per-doctype default-view lookup), which
-    // Meetings has no real counterpart to: it's a computed join over Event +
-    // Event DocType Link, not a single listable doctype with its own View
-    // records. Matches how simple standalone pages already in this same
-    // file (Calendar, Dashboard, Welcome, Notifications) are declared.
+    // meetings booked via frappe_appointment, linked to Leads/Deals).
+    //
+    // The stock /calendar route that normally sits here (name: 'Calendar',
+    // component: @/pages/Calendar.vue) was DELIBERATELY REMOVED from this
+    // file, not just left out - the production deploy that included the
+    // full-upstream-develop version of this file failed with:
+    //   ENOENT: no such file or directory,
+    //   open '.../apps/crm/frontend/src/pages/Calendar.vue'
+    // Investigated before assuming anything: found the exact upstream
+    // frappe/crm commit matching this fork's own frappe-ui pin
+    // (0.1.261 in package.json/yarn.lock - commit bf7fc05e40, the commit
+    // that bumped frappe-ui to that exact version, one hour after
+    // frappe-ui@0.1.261 itself was published) and confirmed Calendar.vue
+    // existed continuously in frappe/crm's own history for the entire
+    // month-plus window where their package.json also pinned frappe-ui to
+    // 0.1.261 (until the next bump, a97626ea4e). So this isn't a
+    // wrong-upstream-version problem - at the exact dependency version this
+    // fork matches, upstream always had this file. The most likely
+    // explanation is that Calendar.vue was removed directly on this
+    // specific server at some point outside of any git history I have
+    // access to (this deploy pipeline never updates the base crm app's own
+    // files - only crm-customizations' and pbx_integration's - so the base
+    // app's actual file tree here is whatever it was at original install,
+    // plus whatever's changed on it since, none of which is tracked
+    // anywhere I can inspect without server access). Given that, the safe
+    // fix is to not depend on this file's existence at all, rather than
+    // guess at which upstream version might or might not have it.
+    //
+    // The rest of this file's routes/beforeEach logic were also rebuilt
+    // from that same verified bf7fc05e40 commit rather than kept from
+    // develop's current (much newer/more complex) version - develop's
+    // beforeEach relies on usersStore functions (isCrmUser, isAdminUser)
+    // and a persona-capture flow that don't exist at this fork's actual
+    // dependency era (bf7fc05e40 uses isWebsiteUser() instead) - keeping
+    // develop's newer logic risked a second, less obvious failure (a
+    // missing named export, which Vite/Rollup can also fail the build on)
+    // on top of the Calendar.vue one.
     path: '/meetings',
     name: 'Meetings',
     component: () => import('@/pages/Meetings.vue'),
@@ -148,11 +150,6 @@ const routes = [
     component: () => import('@/pages/Welcome.vue'),
   },
   {
-    path: '/onboarding',
-    name: 'Onboarding',
-    component: () => import('@/pages/PersonaForm.vue'),
-  },
-  {
     path: '/:invalidpath',
     name: 'Invalid Page',
     component: () => import('@/pages/InvalidPage.vue'),
@@ -174,10 +171,8 @@ let router = createRouter({
 })
 
 router.beforeEach(async (to, from, next) => {
-  router.previousRoute = from
-
-  const { isLoggedIn, user } = sessionStore()
-  const { users, isCrmUser, isAdmin } = usersStore()
+  const { isLoggedIn } = sessionStore()
+  const { users, isWebsiteUser } = usersStore()
 
   if (isLoggedIn && !users.fetched) {
     try {
@@ -187,37 +182,7 @@ router.beforeEach(async (to, from, next) => {
     }
   }
 
-  const isAdminUser = isLoggedIn && (isAdmin() || user === 'Administrator')
-
-  // Only admins who haven't finished may reach the wizard, even via direct URL.
-  if (isLoggedIn && to.name === 'Onboarding') {
-    try {
-      if (!isAdminUser || !(await shouldCapturePersona())) {
-        return next({ name: 'Home' })
-      }
-    } catch {
-      return next({ name: 'Home' })
-    }
-  }
-
-  if (
-    isLoggedIn &&
-    isCrmUser() &&
-    !personaChecked &&
-    to.name !== 'Onboarding' &&
-    isAdminUser
-  ) {
-    personaChecked = true
-    try {
-      if (await shouldCapturePersona()) {
-        return next({ name: 'Onboarding' })
-      }
-    } catch (error) {
-      // fail open
-    }
-  }
-
-  if (isLoggedIn && to.name !== 'Not Permitted' && !isCrmUser()) {
+  if (isLoggedIn && to.name !== 'Not Permitted' && isWebsiteUser()) {
     next({ name: 'Not Permitted' })
   } else if (to.name === 'Home' && isLoggedIn) {
     const { views, getDefaultView } = viewsStore()
@@ -250,87 +215,6 @@ router.beforeEach(async (to, from, next) => {
     const activeTab = localStorage.getItem(storageKey) || 'activity'
     const hash = '#' + activeTab
     next({ ...to, hash })
-  } else if (
-    [
-      'Leads',
-      'Deals',
-      'Contacts',
-      'Organizations',
-      'Notes',
-      'Tasks',
-      'Call Logs',
-    ].includes(to.name) &&
-    !to.query?.view
-  ) {
-    const { views, standardViews, getDefaultView } = viewsStore()
-    await views.promise
-
-    const viewType = to.params?.viewType ?? ''
-    const standardViewTypes = ['list', 'kanban', 'group_by']
-
-    if (!viewType) {
-      const doctypeMap = {
-        Leads: 'CRM Lead',
-        Deals: 'CRM Deal',
-        Contacts: 'Contact',
-        Organizations: 'CRM Organization',
-        Notes: 'FCRM Note',
-        Tasks: 'CRM Task',
-        'Call Logs': 'CRM Call Log',
-      }
-
-      const doctype = doctypeMap[to.name]
-      let defaultViewType = 'list'
-
-      let globalDefault = getDefaultView()
-      if (globalDefault && globalDefault.route_name === to.name) {
-        defaultViewType = globalDefault.type || 'list'
-        if (globalDefault.name && !globalDefault.is_standard) {
-          next({
-            name: to.name,
-            params: { viewType: defaultViewType },
-            query: { ...to.query, view: globalDefault.name },
-          })
-          return
-        }
-      }
-
-      for (const viewType of standardViewTypes) {
-        const standardView = standardViews.value?.[doctype + ' ' + viewType]
-        if (standardView?.is_default) {
-          defaultViewType = viewType
-          break
-        }
-      }
-
-      next({
-        name: to.name,
-        params: { viewType: defaultViewType },
-        query: to.query,
-      })
-    } else if (!standardViewTypes.includes(viewType)) {
-      const viewNameOrLabel = viewType
-
-      let view = views.data?.find(
-        (v) => v.name == viewNameOrLabel || v.label === viewNameOrLabel,
-      )
-
-      if (view) {
-        next({
-          name: to.name,
-          params: { viewType: view.type || 'list' },
-          query: { ...to.query, view: view.name },
-        })
-      } else {
-        next({
-          name: to.name,
-          params: { viewType: 'list' },
-          query: to.query,
-        })
-      }
-    } else {
-      next()
-    }
   } else {
     next()
   }
