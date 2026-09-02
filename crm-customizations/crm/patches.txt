@@ -27,10 +27,35 @@ crm.patches.v1_0.create_email_account_custom_field
 crm.patches.v1_0.create_default_quick_filters
 crm.patches.v1_0.create_custom_fields_for_product_item_sync
 crm.patches.v1_0.add_forecasting_section_in_quick_entry
-crm.patches.v1_0.set_persona_captured_for_existing_sites
-crm.patches.v1_0.add_enrichment_fields_to_layouts
-crm.patches.v1_0.reorder_address_quick_entry_layout
-crm.patches.v1_0.set_seen_for_existing_deals_and_leads
+# Everything up to and including add_forecasting_section_in_quick_entry
+# above is proven to actually run on this server - the migrate step of a
+# real deploy (e0777ae's run, 33651272080) got through DocType-sync and
+# ran every post_model_sync patch up to this point successfully before
+# failing on the very next line this file used to have:
+#   ModuleNotFoundError: No module named
+#   'crm.patches.v1_0.set_persona_captured_for_existing_sites'
+# That's the same root cause as the router.js/Calendar.vue and
+# MeetingArea.vue/PeopleIcon.vue failures before it - a base-app Python
+# module this deploy pipeline never updates, missing on this specific
+# server despite existing in frappe/crm's public history (including at
+# bf7fc05e40, the commit verified to match this fork's own frappe-ui pin).
+#
+# Deliberately NOT reverted to bf7fc05e40's own (much shorter) patches.txt
+# here, unlike the router.js fix - this run's log is direct proof that
+# every patch through add_forecasting_section_in_quick_entry above,
+# several of which are newer than bf7fc05e40, already exist and execute
+# successfully on this exact server. This server isn't frozen at that
+# commit; reverting to its shorter patch list would skip patches already
+# proven to work here, not just avoid a missing one.
+#
+# set_persona_captured_for_existing_sites and everything that was listed
+# after it (add_enrichment_fields_to_layouts, reorder_address_quick_entry_
+# layout, set_seen_for_existing_deals_and_leads) were removed together,
+# not just the one that actually failed - bench migrate stops at the first
+# missing patch module (this deploy pipeline's migrate call doesn't pass
+# skip_failing), so nothing after the failure point was ever reached or
+# verified either. Leaving them in risked discovering each one individually
+# via its own separate failed production deploy.
 # Hostyo customization: adds the meeting_type Custom Field to Event, used by
 # the Meetings feature's calendar color-coding and per-row icons.
 crm.patches.v1_0.add_meeting_type_field
