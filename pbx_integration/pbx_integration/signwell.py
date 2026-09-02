@@ -13,19 +13,27 @@ SIGNWELL_API_BASE = "https://www.signwell.com/api/v1"
 # GET /api/v1/document_templates/{id} - not guessed from the template
 # builder's UI labels. Both templates' "Document Sender" placeholder
 # (HOSTYO LTD / Andreas Pelekanos) is pre-filled and pre-signed in the
-# template itself, so only the customer/owner placeholder is sent here.
+# template itself - but SignWell still requires a recipient entry for
+# every placeholder, so its name/email are recorded here too even though
+# no template_fields are ever sent for it.
 TEMPLATES = {
 	"en": {
 		"config_key": "signwell_template_en",
 		"placeholder_name": "Client",
 		"full_name_api_id": "TextField_1",
 		"property_address_api_id": "TextField_2",
+		"sender_placeholder_name": "Document Sender",
+		"sender_name": "Hostyo",
+		"sender_email": "support@hostyo.com",
 	},
 	"gr": {
 		"config_key": "signwell_template_gr",
 		"placeholder_name": "Ιδιοκτήτης",
 		"full_name_api_id": "TextField_1",
 		"property_address_api_id": "TextField_2",
+		"sender_placeholder_name": "Document Sender",
+		"sender_name": "Hostyo",
+		"sender_email": "support@hostyo.com",
 	},
 }
 
@@ -121,7 +129,13 @@ def send_contract(deal_name, language):
 					"name": contact.full_name,
 					"email": contact.email,
 					"placeholder_name": template["placeholder_name"],
-				}
+				},
+				{
+					"id": "sender",
+					"name": template["sender_name"],
+					"email": template["sender_email"],
+					"placeholder_name": template["sender_placeholder_name"],
+				},
 			],
 			"template_fields": [
 				{"api_id": template["full_name_api_id"], "value": contact.full_name},
