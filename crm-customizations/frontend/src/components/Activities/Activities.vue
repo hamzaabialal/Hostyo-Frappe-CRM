@@ -439,6 +439,24 @@
         @afterSave="(data) => emit('afterSave', data)"
       />
     </div>
+    <div v-else-if="title == 'Meetings'" class="h-full flex flex-col">
+      <div class="flex items-center gap-1 px-3 pt-2.5 sm:px-10">
+        <Button
+          :variant="meetingsView == 'list' ? 'solid' : 'subtle'"
+          :label="__('List')"
+          size="sm"
+          @click="meetingsView = 'list'"
+        />
+        <Button
+          :variant="meetingsView == 'calendar' ? 'solid' : 'subtle'"
+          :label="__('Calendar')"
+          size="sm"
+          @click="meetingsView = 'calendar'"
+        />
+      </div>
+      <MeetingsListView v-if="meetingsView == 'list'" :doctype="doctype" :docname="docname" />
+      <MeetingsCalendarView v-else :doctype="doctype" :docname="docname" />
+    </div>
     <EmptyState
       v-else
       :title="emptyText"
@@ -507,6 +525,8 @@ import NoteArea from '@/components/Activities/NoteArea.vue'
 import TaskArea from '@/components/Activities/TaskArea.vue'
 import AttachmentArea from '@/components/Activities/AttachmentArea.vue'
 import DataFields from '@/components/Activities/DataFields.vue'
+import MeetingsListView from '@/components/Meetings/MeetingsListView.vue'
+import MeetingsCalendarView from '@/components/Meetings/MeetingsCalendarView.vue'
 import UserAvatar from '@/components/UserAvatar.vue'
 import ActivityIcon from '@/components/Icons/ActivityIcon.vue'
 import EmailIcon from '@/components/Icons/EmailIcon.vue'
@@ -582,6 +602,7 @@ const doc = computed(() => _document.doc || {})
 const reload_email = ref(false)
 const modalRef = ref(null)
 const showFilesUploader = ref(false)
+const meetingsView = ref('list')
 
 const title = computed(() => props.tabs?.[tabIndex.value]?.name || 'Activity')
 
