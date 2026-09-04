@@ -254,5 +254,9 @@ doc_events = {
 	},
 	"User": {
 		"validate": "pbx_integration.telnyx.validate_unique_telnyx_did"
+	},
+	"Address": {
+		"before_validate": "pbx_integration.overrides.address.set_address_title",
+		"before_insert": "pbx_integration.overrides.address.set_address_title"
 	}
 }

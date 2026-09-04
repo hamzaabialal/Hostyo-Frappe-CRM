@@ -6,3 +6,4 @@
 # Patches added in this section will be executed after doctypes are migrated
 pbx_integration.patches.add_telnyx_did_field
 pbx_integration.patches.add_signwell_document_id_field
+pbx_integration.patches.add_contract_sent_on_field

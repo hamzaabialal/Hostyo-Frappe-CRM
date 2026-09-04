@@ -22,6 +22,14 @@ TEMPLATES = {
 		"placeholder_name": "Client",
 		"full_name_api_id": "TextField_1",
 		"property_address_api_id": "TextField_2",
+		# Date fields on the "Document Sender" (Hostyo) side of the template.
+		# Prefilled with the send date so no date has to be typed per contract
+		# (client asked for the contract date to default to the day it's
+		# generated). Read off the live template via GET
+		# /document_templates/{id}; re-verify if the template is edited.
+		# EN "DateField_4" is deliberately excluded - it's the Client's own
+		# signing-date field, not Hostyo's.
+		"date_api_ids": ["DateField_1", "DateField_2", "DateField_3"],
 		"sender_placeholder_name": "Document Sender",
 		"sender_name": "Hostyo",
 		"sender_email": "support@hostyo.com",
@@ -31,6 +39,8 @@ TEMPLATES = {
 		"placeholder_name": "Ιδιοκτήτης",
 		"full_name_api_id": "TextField_1",
 		"property_address_api_id": "TextField_2",
+		# All four date fields on the GR template belong to "Document Sender".
+		"date_api_ids": ["DateField_1", "DateField_2", "DateField_3", "DateField_4"],
 		"sender_placeholder_name": "Document Sender",
 		"sender_name": "Hostyo",
 		"sender_email": "support@hostyo.com",
@@ -119,6 +129,28 @@ def send_contract(deal_name, language):
 	template = _template_config(language)
 	contract_sent_status = _deal_status_or_throw("Contract Sent")
 
+	# The date the contract is generated/sent. `sent_on` (YYYY-MM-DD, in the
+	# site's timezone) is what goes on the deal's Frappe Date field below.
+	#
+	# SignWell's template_fields date validator rejects a bare YYYY-MM-DD
+	# ("DateField value must be in Iso8601 format") even though that is
+	# valid ISO 8601 - it wants a full datetime, matching the
+	# "2026-05-14T10:49:28Z" Z-suffixed UTC form SignWell's own API emits
+	# (e.g. template created_at/updated_at). We anchor at 12:00:00Z rather
+	# than 00:00:00Z so that whatever timezone SignWell renders the date in,
+	# it can't roll back/forward to an adjacent calendar day - the contract
+	# must show today's date on the site. A field's own date_format
+	# (DD/MM/YYYY) is only the PDF render format, unrelated to this.
+	sent_on = frappe.utils.nowdate()
+	sent_on_iso = f"{sent_on}T12:00:00Z"
+
+	template_fields = [
+		{"api_id": template["full_name_api_id"], "value": contact.full_name},
+		{"api_id": template["property_address_api_id"], "value": deal.property_address},
+	]
+	for date_api_id in template["date_api_ids"]:
+		template_fields.append({"api_id": date_api_id, "value": sent_on_iso})
+
 	data = _post(
 		"/document_templates/documents",
 		{
@@ -137,10 +169,7 @@ def send_contract(deal_name, language):
 					"placeholder_name": template["sender_placeholder_name"],
 				},
 			],
-			"template_fields": [
-				{"api_id": template["full_name_api_id"], "value": contact.full_name},
-				{"api_id": template["property_address_api_id"], "value": deal.property_address},
-			],
+			"template_fields": template_fields,
 			"metadata": {"crm_deal": deal.name},
 		},
 	)
@@ -149,15 +178,15 @@ def send_contract(deal_name, language):
 	if not document_id:
 		frappe.throw(_("SignWell did not return a document id: {0}").format(data))
 
-	# Persist signwell_document_id via db.set_value (not part of the same
-	# save() as the status change below). CRM Deal has track_changes=1, and
-	# the activity timeline (crm.api.activities.get_deal_activities) only
-	# ever renders the FIRST entry of each Version's "changed" list - if
-	# both fields changed in the same save(), the status change (the one
-	# that actually matters for the timeline) could silently lose that race
-	# depending on field order. Keeping this as its own write guarantees
-	# the status save() below produces a Version whose only changed field
-	# is "status".
+	# Persist signwell_document_id + contract_sent_on via db.set_value (not
+	# part of the same save() as the status change below). CRM Deal has
+	# track_changes=1, and the activity timeline
+	# (crm.api.activities.get_deal_activities) only ever renders the FIRST
+	# entry of each Version's "changed" list - if several fields changed in
+	# the same save(), the status change (the one that actually matters for
+	# the timeline) could silently lose that race depending on field order.
+	# Keeping these as their own write guarantees the status save() below
+	# produces a Version whose only changed field is "status".
 	#
 	# set_value bumps the row's `modified` timestamp in the DB, but leaves
 	# the in-memory `deal` object holding the old one - saving it as-is
@@ -165,7 +194,11 @@ def send_contract(deal_name, language):
 	# you have opened it"). reload() resyncs the whole doc (including the
 	# document id just written) from the DB, so save() below diffs cleanly
 	# against current DB state and only "status" comes out changed.
-	frappe.db.set_value("CRM Deal", deal.name, "signwell_document_id", document_id)
+	frappe.db.set_value(
+		"CRM Deal",
+		deal.name,
+		{"signwell_document_id": document_id, "contract_sent_on": sent_on},
+	)
 	deal.reload()
 
 	deal.status = contract_sent_status
