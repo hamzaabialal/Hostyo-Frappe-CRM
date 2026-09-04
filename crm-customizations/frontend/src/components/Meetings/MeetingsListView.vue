@@ -31,10 +31,21 @@
       </div>
 
       <div v-if="groupedMeetings.thisWeek.length" class="flex flex-col gap-2">
-        <div class="text-sm font-medium text-ink-gray-5">{{ __('Upcoming') }}</div>
+        <div class="text-sm font-medium text-ink-gray-5">{{ __('This Week') }}</div>
         <div class="flex flex-col gap-3">
           <MeetingArea
             v-for="meeting in groupedMeetings.thisWeek"
+            :key="meeting.name"
+            :meeting="meeting"
+          />
+        </div>
+      </div>
+
+      <div v-if="groupedMeetings.later.length" class="flex flex-col gap-2">
+        <div class="text-sm font-medium text-ink-gray-5">{{ __('Later') }}</div>
+        <div class="flex flex-col gap-3">
+          <MeetingArea
+            v-for="meeting in groupedMeetings.later"
             :key="meeting.name"
             :meeting="meeting"
           />
@@ -124,23 +135,23 @@ const meetings = createResource({
 // Bucket definitions:
 // - past: starts_on before the start of today
 // - today: starts_on falls on today's calendar date
-// - thisWeek: everything from tomorrow onward
+// - thisWeek: tomorrow through 7 days from today (exclusive)
+// - later: everything from 7 days out onward
 //
-// The "thisWeek" bucket is, as implemented, actually unbounded upward - it
-// is NOT clipped to the end of the current calendar week. There's no fourth
-// "Later"/"Upcoming" section specified, and silently dropping meetings
-// further out felt worse than a slightly imprecise label - a meeting three
-// weeks out will still show, just grouped under "This Week". Worth deciding
-// explicitly (add a real week upper-bound + a "Later" section, or rename
-// this bucket) rather than something to leave as an unflagged assumption.
+// thisWeek is now capped (previously unbounded, flagged as an open decision
+// - resolved: cap at 7 days, add a 4th "Later" section, no relabeling of
+// the bucket names themselves needed since "thisWeek" was already accurate
+// once capped).
 const groupedMeetings = computed(() => {
-  const groups = { today: [], thisWeek: [], past: [] }
+  const groups = { today: [], thisWeek: [], later: [], past: [] }
   const data = meetings.data || []
 
   const now = new Date()
   const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate())
   const startOfTomorrow = new Date(startOfToday)
   startOfTomorrow.setDate(startOfToday.getDate() + 1)
+  const weekCutoff = new Date(startOfToday)
+  weekCutoff.setDate(startOfToday.getDate() + 7)
 
   for (const meeting of data) {
     if (!meeting.starts_on) {
@@ -152,8 +163,10 @@ const groupedMeetings = computed(() => {
       groups.past.push(meeting)
     } else if (startsOn < startOfTomorrow) {
       groups.today.push(meeting)
-    } else {
+    } else if (startsOn < weekCutoff) {
       groups.thisWeek.push(meeting)
+    } else {
+      groups.later.push(meeting)
     }
   }
 

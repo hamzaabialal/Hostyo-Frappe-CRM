@@ -62,6 +62,13 @@
           </Dropdown>
         </div>
       </div>
+      <!-- Short description - Event.description, added to get_meetings'
+           select() alongside this. Truncated to 2 lines rather than shown
+           in full - these cards are meant to be scannable in a list, not a
+           place to read a full meeting description. -->
+      <div v-if="meeting.description" class="line-clamp-2 text-sm text-ink-gray-6">
+        {{ meeting.description }}
+      </div>
       <div class="flex items-center flex-wrap gap-2">
         <Badge :label="formatDate(meeting.starts_on, 'MMM D, dddd')">
           <template #prefix>

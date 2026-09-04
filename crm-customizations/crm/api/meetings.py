@@ -65,12 +65,18 @@ def _local_to_utc_iso(date, time_str, user_timezone_offset):
 	here. This function's own math is UNAFFECTED by that and must stay
 	exactly as it is below - it only controls what's actually stored as the
 	event's start/end, using user_timezone_offset RAW, in its original
-	(JS getTimezoneOffset) sign. The mismatch itself is handled separately,
-	for the *other* copy of user_timezone_offset that gets passed straight
-	through as book_time_slot's own parameter - see
-	_frappe_appointment_timezone_offset below. Do not fix one by copying the
-	other's convention; they are deliberately different values feeding two
-	pieces of code that disagree with each other's sign convention.
+	(JS getTimezoneOffset) sign.
+
+	As of 2026-09-04, that mismatch is moot for the actual call path -
+	book_meeting now calls pbx_integration.personal_meetings.
+	book_personal_meeting, which doesn't call is_valid_time_slots/
+	hours_to_time_slot at all (see that module's docstring for why). The
+	sign-flip helper this docstring used to point at
+	(_frappe_appointment_timezone_offset, below) is left in place but
+	unused for the same reason. Still worth keeping this note here: if that
+	validation chain is ever called from this file again, do not fix its
+	sign mismatch by touching this function's math - they are deliberately
+	different conventions feeding two different pieces of code.
 
 	Returned as a space-separated string with an explicit UTC offset (e.g.
 	"2026-09-04 16:55:00+00:00"), not a bare T-separated one - confirmed via
@@ -94,7 +100,15 @@ def _local_to_utc_iso(date, time_str, user_timezone_offset):
 
 
 def _frappe_appointment_timezone_offset(user_timezone_offset):
-	"""Flip user_timezone_offset's sign for the SEPARATE copy of it passed
+	"""UNUSED as of 2026-09-04 - book_meeting now calls
+	pbx_integration.personal_meetings.book_personal_meeting instead of
+	frappe_appointment's book_time_slot chain, which no longer runs
+	is_valid_time_slots/hours_to_time_slot (the only consumers of this
+	flipped value) at all. Left in place, not deleted, in case that
+	validation chain is ever called from here again - same reasoning as
+	leaving pbx_integration/overrides/personal_meet.py in place unused.
+
+	Flip user_timezone_offset's sign for the SEPARATE copy of it passed
 	straight through as book_time_slot's own user_timezone_offset parameter
 	- NOT for _local_to_utc_iso above, which must keep using the raw value
 	unflipped (see that function's docstring - two different conventions,
@@ -208,18 +222,24 @@ def book_meeting(
 	wasn't traced further here - worth confirming once this is actually
 	wired up and testable end to end).
 
-	Imports pbx_integration's own overrides.personal_meet.book_time_slot
-	instead of frappe_appointment.api.personal_meet's original - a
-	bugfixed fork (see that module's docstring for the full list). hooks.py's
-	override_whitelisted_methods entry for the same fork only intercepts
-	calls dispatched through Frappe's HTTP method-call layer - it has no
-	effect on this direct Python import, so this import has to point at the
-	fork explicitly for this call site to actually get the fix.
+	As of 2026-09-04, calls pbx_integration's own personal_meetings.
+	book_personal_meeting instead of frappe_appointment's book_time_slot (via
+	either the original or pbx_integration/overrides/personal_meet.py, our
+	earlier bugfixed fork of it) - after three separate pre-existing bugs
+	found and fixed in that upstream chain in a row, a 4th "Invalid attendee
+	email" 400 still happened even with all three fixes applied. Rather than
+	keep patching someone else's library bug by bug, book_personal_meeting
+	reimplements only what booking a personal meeting actually needs, from
+	pieces individually tested and confirmed working on this site. See that
+	module's own docstring for the full reasoning, including a deliberate
+	scope decision (a simple double-booking check, not a reimplementation of
+	frappe_appointment's weekly-availability-window logic).
+	The old fork is left in place, unused, in case it's needed for reference.
 	"""
 	if not frappe.has_permission(reference_doctype, "read", reference_name):
 		frappe.throw(_("Not permitted"), frappe.PermissionError)
 
-	from pbx_integration.overrides.personal_meet import book_time_slot
+	from pbx_integration.personal_meetings import book_personal_meeting
 
 	custom_doctype_link_with_event = json.dumps(
 		[
@@ -231,12 +251,12 @@ def book_meeting(
 		]
 	)
 
-	response = book_time_slot(
+	response = book_personal_meeting(
 		duration_id=duration_id,
 		date=date,
 		start_time=_local_to_utc_iso(date, start_time, user_timezone_offset),
 		end_time=_local_to_utc_iso(date, end_time, user_timezone_offset),
-		user_timezone_offset=_frappe_appointment_timezone_offset(user_timezone_offset),
+		user_timezone_offset=user_timezone_offset,
 		user_name=user_name,
 		user_email=user_email,
 		other_participants=other_participants,
@@ -341,6 +361,7 @@ def get_meetings(reference_doctype: str = None, reference_name: str = None):
 		.select(
 			Event.name,
 			Event.subject,
+			Event.description,
 			Event.starts_on,
 			Event.ends_on,
 			Event.all_day,
