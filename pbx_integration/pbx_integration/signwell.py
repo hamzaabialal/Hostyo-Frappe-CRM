@@ -131,17 +131,19 @@ def send_contract(deal_name, language):
 
 	# The date the contract is generated/sent - stored on the deal below and
 	# prefilled into the template's date fields so it defaults to today
-	# rather than being left blank. DD/MM/YYYY matches every date field's
-	# own date_format on both templates.
+	# rather than being left blank. SignWell's template_fields API requires
+	# a date field's value in ISO 8601 (it rejected DD/MM/YYYY with
+	# "DateField value must be in Iso8601 format"); a field's own
+	# date_format (DD/MM/YYYY here) is only how SignWell renders it in the
+	# PDF, not what the API accepts. nowdate() is already YYYY-MM-DD.
 	sent_on = frappe.utils.nowdate()
-	sent_on_display = frappe.utils.getdate(sent_on).strftime("%d/%m/%Y")
 
 	template_fields = [
 		{"api_id": template["full_name_api_id"], "value": contact.full_name},
 		{"api_id": template["property_address_api_id"], "value": deal.property_address},
 	]
 	for date_api_id in template["date_api_ids"]:
-		template_fields.append({"api_id": date_api_id, "value": sent_on_display})
+		template_fields.append({"api_id": date_api_id, "value": sent_on})
 
 	data = _post(
 		"/document_templates/documents",
