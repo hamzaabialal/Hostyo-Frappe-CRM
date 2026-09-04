@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import frappe
 from frappe import _
@@ -65,13 +65,26 @@ def _local_to_utc_iso(date, time_str, user_timezone_offset):
 	here, and not something this app can fix (frappe_appointment isn't in
 	this repo). This function only controls what's actually stored as the
 	event's start/end - it does not touch that separate validation path.
+
+	Returned as a space-separated string with an explicit UTC offset (e.g.
+	"2026-09-04 16:55:00+00:00"), not a bare T-separated one - confirmed via
+	a live traceback that is_valid_time_slots (in the same book_time_slot ->
+	_create_event_for_appointment_group chain this feeds) parses start_time/
+	end_time with datetime.strptime(value, "%Y-%m-%d %H:%M:%S%z"), which
+	needs both the space separator and an offset; a bare T-separated,
+	offset-less string raises ValueError there. utc_to_sys_time's own
+	fromisoformat() call (the other consumer of this same value, inside
+	_create_event_for_appointment_group) accepts this format identically to
+	the old one - verified empirically, not assumed: parsing this and then
+	.replace(tzinfo=None) yields the exact same naive datetime either way,
+	since the attached offset is +00:00 (no actual shift).
 	"""
 	combined = _combine_date_time(date, time_str)
 	if not combined:
 		return combined
 	local_dt = datetime.fromisoformat(combined)
-	utc_dt = local_dt + timedelta(minutes=int(user_timezone_offset))
-	return utc_dt.isoformat()
+	utc_dt = (local_dt + timedelta(minutes=int(user_timezone_offset))).replace(tzinfo=timezone.utc)
+	return utc_dt.isoformat(sep=" ")
 
 
 @frappe.whitelist()
