@@ -1,13 +1,23 @@
 """Fork of frappe_appointment's api.personal_meet.book_time_slot, forked
-2026-09-04, with exactly one bugfix.
+2026-09-04, with two bugfixes so far (both pre-existing upstream, both
+found via live tracebacks, neither introduced by this fork).
 
-Upstream bug (confirmed via a live 400 from Google Calendar's API,
-"Invalid attendee email", on every personal-meeting booking through
+Bug 1 (confirmed via a live 400 from Google Calendar's API, "Invalid
+attendee email", on every personal-meeting booking through
 crm.api.meetings.book_meeting): the organizer's event_participants entry
 is built from user_availability.get("user") - a User docname (e.g.
 "Administrator"), not an email address - instead of looking up that
-User's actual email. Not vendored anywhere in this repo (frappe_appointment
-is installed separately, its source lives at
+User's actual email. See the fix inline below.
+
+Bug 2 (confirmed via a live KeyError: 'doctype'): the
+custom_doctype_link_with_event dedup check used link["doctype"]/
+link["name"], but every dict in that list actually uses
+reference_doctype/reference_docname - the original keys raised KeyError
+the moment a caller supplied its own custom_doctype_link_with_event, which
+crm.api.meetings.book_meeting does on every call. See the fix inline below.
+
+Not vendored anywhere in this repo (frappe_appointment is installed
+separately, its source lives at
 rtCamp/frappe-appointment/frappe_appointment/api/personal_meet.py), and not
 worth patching the installed file directly since that gets wiped on any
 frappe_appointment upgrade - forked here instead, registered via
@@ -16,11 +26,11 @@ crm.api.meetings.book_meeting in place of the original (see that file's own
 import - override_whitelisted_methods only intercepts calls dispatched
 through Frappe's HTTP method-call layer, frappe.handler.execute_cmd; it has
 no effect on a direct Python import-and-call like book_meeting's own, so
-that import also has to point here for the actual reported bug to be fixed,
-not just the raw HTTP endpoint).
+that import also has to point here for the actual reported bugs to be
+fixed, not just the raw HTTP endpoint).
 
 Everything else below is an exact copy of the original. Check upstream next
-time frappe_appointment is upgraded, in case this has since been fixed
+time frappe_appointment is upgraded, in case these have since been fixed
 there - if so, this fork, hooks.py's override_whitelisted_methods entry,
 and meetings.py's import of this module instead of the original can all be
 removed.
@@ -108,7 +118,16 @@ def book_time_slot(
 	else:
 		original_link = json.loads(args["custom_doctype_link_with_event"])
 		for link in original_link:
-			if link["doctype"] == "User Appointment Availability" and link["name"] == user_availability.get("name"):
+			# Bugfix (second one in this fork - also pre-existing upstream, not
+			# introduced here): the original checked link["doctype"]/
+			# link["name"], but every dict in this list - both the one built
+			# above and any caller-supplied one (e.g. meetings.py's own
+			# {"reference_doctype": ..., "reference_docname": ..., "value": ...})
+			# - actually uses reference_doctype/reference_docname. The original
+			# keys always raised KeyError the moment a caller supplied its own
+			# custom_doctype_link_with_event, which is exactly what
+			# crm.api.meetings.book_meeting does on every call.
+			if link["reference_doctype"] == "User Appointment Availability" and link["reference_docname"] == user_availability.get("name"):
 				break
 		else:
 			original_link.append(custom_doctype_link_with_event[0])
