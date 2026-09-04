@@ -62,9 +62,15 @@ def _local_to_utc_iso(date, time_str, user_timezone_offset):
 	pytz.FixedOffset(int(user_timezone_offset))) reads this same raw value
 	with the OPPOSITE (conventional, east-of-UTC-positive) sign - a
 	pre-existing mismatch inside frappe_appointment itself, not introduced
-	here, and not something this app can fix (frappe_appointment isn't in
-	this repo). This function only controls what's actually stored as the
-	event's start/end - it does not touch that separate validation path.
+	here. This function's own math is UNAFFECTED by that and must stay
+	exactly as it is below - it only controls what's actually stored as the
+	event's start/end, using user_timezone_offset RAW, in its original
+	(JS getTimezoneOffset) sign. The mismatch itself is handled separately,
+	for the *other* copy of user_timezone_offset that gets passed straight
+	through as book_time_slot's own parameter - see
+	_frappe_appointment_timezone_offset below. Do not fix one by copying the
+	other's convention; they are deliberately different values feeding two
+	pieces of code that disagree with each other's sign convention.
 
 	Returned as a space-separated string with an explicit UTC offset (e.g.
 	"2026-09-04 16:55:00+00:00"), not a bare T-separated one - confirmed via
@@ -85,6 +91,39 @@ def _local_to_utc_iso(date, time_str, user_timezone_offset):
 	local_dt = datetime.fromisoformat(combined)
 	utc_dt = (local_dt + timedelta(minutes=int(user_timezone_offset))).replace(tzinfo=timezone.utc)
 	return utc_dt.isoformat(sep=" ")
+
+
+def _frappe_appointment_timezone_offset(user_timezone_offset):
+	"""Flip user_timezone_offset's sign for the SEPARATE copy of it passed
+	straight through as book_time_slot's own user_timezone_offset parameter
+	- NOT for _local_to_utc_iso above, which must keep using the raw value
+	unflipped (see that function's docstring - two different conventions,
+	deliberately, feeding two different pieces of code).
+
+	frappe_appointment's own availability-window validation
+	(is_valid_time_slots/hours_to_time_slot in appointment_group.py) feeds
+	this value into pytz.FixedOffset(int(user_timezone_offset)) - a
+	convention where positive means AHEAD of UTC. BookMeetingModal.vue sends
+	the browser's raw JS Date#getTimezoneOffset() value instead - positive
+	means BEHIND UTC, the opposite sign meaning. Left unflipped, this
+	mismatch made is_valid_time_slots reject genuinely available slots
+	outright, on every single booking - confirmed via a live traceback and
+	reproduced offline against frappe_appointment's real functions: a real
+	UTC-4 browser's raw offset ("240") computed a real, listed slot's own
+	"local day" as one day later than it actually was (frappe_appointment's
+	pytz.FixedOffset(240) reads as UTC+4, not the intended UTC-4), which
+	then failed both the day-bucket selection AND the per-slot day filter
+	inside that validation. Negating it here ("-240") made the same slot
+	compute its correct local day and pass - verified the same way, not
+	assumed.
+
+	Do not "fix" this by touching _local_to_utc_iso's own math instead -
+	that function already uses the correct, unflipped convention for what
+	it does (computing the actual stored start/end), and flipping it there
+	would make every meeting land at the wrong wall-clock time while
+	leaving this validation-only mismatch untouched.
+	"""
+	return str(-int(user_timezone_offset))
 
 
 @frappe.whitelist()
@@ -171,9 +210,7 @@ def book_meeting(
 
 	Imports pbx_integration's own overrides.personal_meet.book_time_slot
 	instead of frappe_appointment.api.personal_meet's original - a
-	one-line-bugfixed fork (see that module's docstring: the original builds
-	an organizer attendee email from a User docname instead of a real email
-	lookup, which Google Calendar's API rejects outright). hooks.py's
+	bugfixed fork (see that module's docstring for the full list). hooks.py's
 	override_whitelisted_methods entry for the same fork only intercepts
 	calls dispatched through Frappe's HTTP method-call layer - it has no
 	effect on this direct Python import, so this import has to point at the
@@ -199,7 +236,7 @@ def book_meeting(
 		date=date,
 		start_time=_local_to_utc_iso(date, start_time, user_timezone_offset),
 		end_time=_local_to_utc_iso(date, end_time, user_timezone_offset),
-		user_timezone_offset=user_timezone_offset,
+		user_timezone_offset=_frappe_appointment_timezone_offset(user_timezone_offset),
 		user_name=user_name,
 		user_email=user_email,
 		other_participants=other_participants,
