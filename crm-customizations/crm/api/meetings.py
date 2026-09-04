@@ -168,11 +168,21 @@ def book_meeting(
 	@add_response_code, whose exact behavior on the returned tuple/dict
 	wasn't traced further here - worth confirming once this is actually
 	wired up and testable end to end).
+
+	Imports pbx_integration's own overrides.personal_meet.book_time_slot
+	instead of frappe_appointment.api.personal_meet's original - a
+	one-line-bugfixed fork (see that module's docstring: the original builds
+	an organizer attendee email from a User docname instead of a real email
+	lookup, which Google Calendar's API rejects outright). hooks.py's
+	override_whitelisted_methods entry for the same fork only intercepts
+	calls dispatched through Frappe's HTTP method-call layer - it has no
+	effect on this direct Python import, so this import has to point at the
+	fork explicitly for this call site to actually get the fix.
 	"""
 	if not frappe.has_permission(reference_doctype, "read", reference_name):
 		frappe.throw(_("Not permitted"), frappe.PermissionError)
 
-	from frappe_appointment.api.personal_meet import book_time_slot
+	from pbx_integration.overrides.personal_meet import book_time_slot
 
 	custom_doctype_link_with_event = json.dumps(
 		[

@@ -178,6 +178,27 @@ app_license = "mit"
 # 	"frappe.desk.doctype.event.event.get_events": "pbx_integration.event.get_events"
 # }
 #
+
+# frappe_appointment's book_time_slot builds an organizer attendee email
+# from a User docname instead of a real lookup - see
+# pbx_integration/overrides/personal_meet.py's module docstring for the full
+# writeup. Path is frappe_appointment.api.personal_meet.book_time_slot (NOT
+# frappe_appointment.frappe_appointment.api...) - confirmed against
+# frappe_appointment's actual repo layout (api/ is a top-level dir, not
+# nested under the doctype-module folder that only doctype controllers use).
+#
+# This alone only affects calls dispatched through Frappe's HTTP
+# method-call layer (frappe.handler.execute_cmd) - it does NOT affect
+# crm.api.meetings.book_meeting's own direct Python import of book_time_slot,
+# which is the actual call path that hit this bug. That import was changed
+# to point at pbx_integration.overrides.personal_meet.book_time_slot
+# directly instead - this hook is a complementary fix for any other, genuine
+# HTTP caller of the original endpoint (e.g. frappe_appointment's own
+# personal-meeting booking page).
+override_whitelisted_methods = {
+	"frappe_appointment.api.personal_meet.book_time_slot": "pbx_integration.overrides.personal_meet.book_time_slot"
+}
+#
 # each overriding function accepts a `data` argument;
 # generated from the base implementation of the doctype dashboard,
 # along with any modifications made in other Frappe apps
