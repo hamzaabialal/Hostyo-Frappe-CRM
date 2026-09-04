@@ -129,21 +129,27 @@ def send_contract(deal_name, language):
 	template = _template_config(language)
 	contract_sent_status = _deal_status_or_throw("Contract Sent")
 
-	# The date the contract is generated/sent - stored on the deal below and
-	# prefilled into the template's date fields so it defaults to today
-	# rather than being left blank. SignWell's template_fields API requires
-	# a date field's value in ISO 8601 (it rejected DD/MM/YYYY with
-	# "DateField value must be in Iso8601 format"); a field's own
-	# date_format (DD/MM/YYYY here) is only how SignWell renders it in the
-	# PDF, not what the API accepts. nowdate() is already YYYY-MM-DD.
+	# The date the contract is generated/sent. `sent_on` (YYYY-MM-DD, in the
+	# site's timezone) is what goes on the deal's Frappe Date field below.
+	#
+	# SignWell's template_fields date validator rejects a bare YYYY-MM-DD
+	# ("DateField value must be in Iso8601 format") even though that is
+	# valid ISO 8601 - it wants a full datetime, matching the
+	# "2026-05-14T10:49:28Z" Z-suffixed UTC form SignWell's own API emits
+	# (e.g. template created_at/updated_at). We anchor at 12:00:00Z rather
+	# than 00:00:00Z so that whatever timezone SignWell renders the date in,
+	# it can't roll back/forward to an adjacent calendar day - the contract
+	# must show today's date on the site. A field's own date_format
+	# (DD/MM/YYYY) is only the PDF render format, unrelated to this.
 	sent_on = frappe.utils.nowdate()
+	sent_on_iso = f"{sent_on}T12:00:00Z"
 
 	template_fields = [
 		{"api_id": template["full_name_api_id"], "value": contact.full_name},
 		{"api_id": template["property_address_api_id"], "value": deal.property_address},
 	]
 	for date_api_id in template["date_api_ids"]:
-		template_fields.append({"api_id": date_api_id, "value": sent_on})
+		template_fields.append({"api_id": date_api_id, "value": sent_on_iso})
 
 	data = _post(
 		"/document_templates/documents",
