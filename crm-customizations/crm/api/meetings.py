@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta
 
 import frappe
 from frappe import _
@@ -16,6 +17,99 @@ def is_meetings_enabled():
 	verified exact copy of its internals).
 	"""
 	return "frappe_appointment" in frappe.get_installed_apps()
+
+
+def _combine_date_time(date, time_str):
+	"""frappe_appointment's book_time_slot eventually passes start_time/
+	end_time into utc_to_sys_time(), which calls datetime.fromisoformat()
+	directly on whatever it's given - date is never merged in on
+	frappe_appointment's side (confirmed against its source: date is only
+	used there for separate slot-validity checks). BookMeetingModal.vue
+	sends bare clock times from an <input type="time"> ("17:55", no
+	seconds) for start_time and a client-computed "18:25:00" (with seconds)
+	for end_time - neither is a full datetime, and they aren't even
+	consistent with each other on seconds - so this combines each with date
+	here, padding on ":00" when seconds are missing. Just the local
+	wall-clock combination - see _local_to_utc_iso for the UTC conversion
+	that actually has to happen before either reaches book_time_slot.
+	"""
+	if not time_str or "T" in time_str:
+		return time_str
+	if time_str.count(":") == 1:
+		time_str = f"{time_str}:00"
+	return f"{date}T{time_str}"
+
+
+def _local_to_utc_iso(date, time_str, user_timezone_offset):
+	"""utc_to_sys_time() (see _combine_date_time's docstring) does no timezone
+	conversion of its own - it strips tzinfo and assumes whatever it's given
+	already IS UTC. _combine_date_time only produces a LOCAL wall-clock
+	datetime (the agent's own browser time, from date + start_time/end_time
+	as picked in the booking form), so that has to actually be converted to
+	UTC before it reaches book_time_slot, or every meeting lands at the
+	wrong wall-clock time for any agent not in UTC - silently, no crash.
+
+	Sign convention for user_timezone_offset (confirmed, don't flip this):
+	BookMeetingModal.vue sends it as the browser's raw, unmodified
+	JS Date#getTimezoneOffset() value - minutes, POSITIVE when the local
+	zone is BEHIND UTC (e.g. UTC-4 -> +240, matching a real failing request),
+	NEGATIVE when ahead (e.g. UTC+5:30 -> -330). That's JS's own documented
+	convention, and it's the OPPOSITE sign from the usual "+HH:MM east of
+	UTC" notation. So: UTC = local + offset_minutes.
+
+	Note frappe_appointment's OWN internal availability-window validation
+	(is_valid_time_slots/hours_to_time_slot, via utc_to_given_time_zone ->
+	pytz.FixedOffset(int(user_timezone_offset))) reads this same raw value
+	with the OPPOSITE (conventional, east-of-UTC-positive) sign - a
+	pre-existing mismatch inside frappe_appointment itself, not introduced
+	here, and not something this app can fix (frappe_appointment isn't in
+	this repo). This function only controls what's actually stored as the
+	event's start/end - it does not touch that separate validation path.
+	"""
+	combined = _combine_date_time(date, time_str)
+	if not combined:
+		return combined
+	local_dt = datetime.fromisoformat(combined)
+	utc_dt = local_dt + timedelta(minutes=int(user_timezone_offset))
+	return utc_dt.isoformat()
+
+
+@frappe.whitelist()
+def get_available_durations(user="Administrator"):
+	"""Return the given organizer's configured meeting-length options, for
+	BookMeetingModal.vue's "Duration" select - previously a hardcoded
+	15/30/45/60-minute list with no connection to any real backend data, and
+	a separate free-text "Duration Slot ID" field the user had to know and
+	type by hand (e.g. hostyo-30m, or the 15m/45m rows' auto-generated hash
+	names, created via the Desk UI rather than console - not something
+	anyone could reasonably remember or retype).
+
+	available_durations is frappe_appointment's own child table
+	(Appointment Slot Duration, a child of User Appointment Availability),
+	fetched via frappe.get_doc rather than frappe.client.get_list -
+	confirmed by testing that get_list hits check_parent_permission and
+	throws PermissionError against this child table under the current
+	user's permissions, where get_doc on the parent does not.
+
+	duration is returned in seconds, exactly as stored - Frappe's standard
+	Duration fieldtype convention (confirmed against the live site: e.g.
+	the "15 Min Call" row stores 900, not 15) - deliberately not converted
+	here, so the frontend's end-time math and this field's actual meaning
+	can't quietly drift apart from what frappe_appointment itself uses this
+	same stored value for (duration.duration is passed straight through
+	into its own dummy Appointment Group's duration_for_event untouched).
+
+	No permission check beyond the child-table access itself: this only
+	exposes duration labels/lengths for an organizer's *personal meeting*
+	booking page, the same information frappe_appointment's own
+	get_meeting_windows already exposes to allow_guest callers - nothing
+	sensitive.
+	"""
+	availability = frappe.get_doc("User Appointment Availability", user)
+	return [
+		{"name": row.name, "title": row.title, "duration": row.duration}
+		for row in availability.available_durations
+	]
 
 
 @frappe.whitelist()
@@ -80,8 +174,8 @@ def book_meeting(
 	response = book_time_slot(
 		duration_id=duration_id,
 		date=date,
-		start_time=start_time,
-		end_time=end_time,
+		start_time=_local_to_utc_iso(date, start_time, user_timezone_offset),
+		end_time=_local_to_utc_iso(date, end_time, user_timezone_offset),
 		user_timezone_offset=user_timezone_offset,
 		user_name=user_name,
 		user_email=user_email,
