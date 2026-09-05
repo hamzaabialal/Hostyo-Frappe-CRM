@@ -69,11 +69,22 @@
           />
         </div>
 
+        <!-- Options come from get_available_durations (organizer's real
+             Appointment Slot Duration rows) - selecting one sets both
+             form.duration_id (the FK frappe_appointment actually needs) and
+             the row's own duration (seconds) used for computeEndTime(),
+             from the same source. Replaces the old pairing of a hardcoded
+             15/30/45/60-minute select with zero connection to real data,
+             plus a separate free-text "Duration Slot ID" field the user had
+             to know and type by hand (including two rows with
+             auto-generated hash names, created via the Desk UI - not
+             something anyone could reliably remember or retype). -->
         <FormControl
           type="select"
           :label="__('Duration')"
-          v-model="form.duration_minutes"
+          v-model="form.duration_id"
           :options="durationOptions"
+          :disabled="availableDurations.loading"
         />
 
         <FormControl
@@ -81,24 +92,6 @@
           :label="__('Meeting Type')"
           v-model="form.meeting_type"
           :options="meetingTypeOptions"
-        />
-
-        <!-- duration_id is a required, separate thing from the friendly
-             "Duration" select above - it's a foreign key to a specific,
-             pre-configured Appointment Slot Duration record (a child of some
-             organizer's User Appointment Availability in frappe_appointment),
-             not just a number of minutes. There's no endpoint in meetings.py
-             yet to look up an organizer's available durations (that would be
-             frappe_appointment's own get_schedular_link/get_meeting_windows,
-             not wrapped here), so this is a raw ID input for now rather than
-             a picker backed by real data - a real gap, flagged rather than
-             hidden behind a fake-looking dropdown. -->
-        <FormControl
-          type="text"
-          :label="__('Duration Slot ID')"
-          v-model="form.duration_id"
-          :placeholder="__('Appointment Slot Duration ID')"
-          :description="__('Required by frappe_appointment - identifies which organizer/availability this booking is against. No lookup exists yet for this, so it must be entered directly.')"
         />
 
         <div class="grid grid-cols-2 gap-4">
@@ -176,12 +169,37 @@ const effectiveReferenceName = computed(() =>
   isGlobalMode.value ? pickerValue.value : props.docname,
 )
 
-const durationOptions = [
-  { label: __('15 minutes'), value: '15' },
-  { label: __('30 minutes'), value: '30' },
-  { label: __('45 minutes'), value: '45' },
-  { label: __('60 minutes'), value: '60' },
-]
+// Fetched once (auto: true), same "load once, cheap to keep around" shape
+// composables/meetings.js already uses for is_meetings_enabled - this
+// modal instance stays mounted across opens (see the show watcher below),
+// so there's no need to re-fetch on every open; an organizer's configured
+// durations aren't expected to change mid-session.
+const availableDurations = createResource({
+  url: 'crm.api.meetings.get_available_durations',
+  auto: true,
+})
+
+// { label, value } for the "Duration" select, sourced from the organizer's
+// real Appointment Slot Duration rows instead of the old hardcoded
+// 15/30/45/60-minute list. value is each row's own name (its
+// duration_id) - some of these are auto-generated hashes (created via the
+// Desk UI, not console), never assumed readable, always taken from the
+// API response itself.
+const durationOptions = computed(() =>
+  (availableDurations.data || []).map((row) => ({ label: row.title, value: row.name })),
+)
+
+// The selected row's own duration, in seconds as returned by
+// get_available_durations (Frappe's standard Duration fieldtype storage
+// unit - not minutes) - used by computeEndTime() below instead of the old
+// form.duration_minutes * 60 math, so the end time actually sent always
+// matches the real duration of whatever Appointment Slot Duration
+// duration_id points at, rather than two separate, independently-editable
+// fields that could disagree.
+const selectedDurationSeconds = computed(() => {
+  const row = (availableDurations.data || []).find((r) => r.name === form.duration_id)
+  return row ? row.duration : 0
+})
 
 // Same 8 options as the meeting_type Custom Field itself
 // (crm/patches/v1_0/add_meeting_type_field.py) - kept in sync manually
@@ -201,7 +219,6 @@ const meetingTypeOptions = [
 const form = reactive({
   date: '',
   start_time: '',
-  duration_minutes: '30',
   duration_id: '',
   user_name: '',
   user_email: '',
@@ -224,14 +241,17 @@ watch(show, (value) => {
 })
 
 // book_time_slot's HH:mm:ss end_time is computed client-side from
-// date + start_time + the friendly duration select - the backend takes
-// start_time/end_time as fully independent literal params (confirmed
-// against its actual source), it doesn't derive one from duration_id itself.
+// date + start_time + the selected duration's own length in seconds - the
+// backend takes start_time/end_time as fully independent literal params
+// (confirmed against its actual source), it doesn't derive one from
+// duration_id itself. Requires a real selected duration (no default
+// preselected, since the options load asynchronously) - returns '' until
+// one's actually picked, same as the missing-date/start_time cases below.
 function computeEndTime() {
-  if (!form.date || !form.start_time) return ''
+  if (!form.date || !form.start_time || !selectedDurationSeconds.value) return ''
   const start = new Date(`${form.date}T${form.start_time}`)
   if (Number.isNaN(start.getTime())) return ''
-  const end = new Date(start.getTime() + Number(form.duration_minutes) * 60 * 1000)
+  const end = new Date(start.getTime() + selectedDurationSeconds.value * 1000)
   return end.toTimeString().slice(0, 8)
 }
 
@@ -245,7 +265,7 @@ function submit() {
 
   const end_time = computeEndTime()
   if (!form.date || !form.start_time || !end_time || !form.duration_id || !form.user_email) {
-    errorMessage.value = __('Date, start time, duration slot ID, and guest email are required.')
+    errorMessage.value = __('Date, start time, duration, and guest email are required.')
     return
   }
   if (!effectiveReferenceName.value) {
@@ -259,11 +279,14 @@ function submit() {
       date: form.date,
       start_time: form.start_time,
       end_time,
-      // Date#getTimezoneOffset()'s sign/unit convention hasn't been
-      // verified against what frappe_appointment's helpers.utils actually
-      // expects (get_today_min_max_time/convert_timezone_to_utc weren't
-      // traced that closely) - passed through as the best available
-      // guess, not a confirmed-correct value.
+      // Sent unmodified, on purpose - meetings.py's _local_to_utc_iso()
+      // relies on exactly this raw JS convention (minutes, POSITIVE when
+      // the local zone is BEHIND UTC) to convert the picked date/time to
+      // UTC before it reaches book_time_slot. Confirmed against
+      // frappe_appointment's source - see that function's docstring for
+      // the full sign-convention writeup (including a separate, unrelated
+      // mismatch inside frappe_appointment's own slot-validation code, that
+      // this value is NOT flipped to work around). Do not negate this.
       user_timezone_offset: String(new Date().getTimezoneOffset()),
       user_name: form.user_name,
       user_email: form.user_email,
