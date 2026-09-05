@@ -27,6 +27,14 @@ RING_GROUP_CACHE_TTL = 120
 # comfortably outlive any real call.
 CUSTOMER_CALL_STATE_TTL = 4 * 60 * 60
 
+# Speech-recognition engine for post-call transcription (record_start's
+# `transcription_engine`). Calls happen in both English and Greek with no
+# way to know which up front, so this must be an engine that auto-detects
+# rather than a fixed transcription_language. "deepgram/nova-3" is the
+# multilingual default; if Greek accuracy is weak in testing, switch to
+# Telnyx's own engine ("B") - this one line is the only change needed.
+TRANSCRIPTION_ENGINE = "deepgram/nova-3"
+
 
 def _api_key():
     key = frappe.conf.get("telnyx_api_key")
@@ -308,6 +316,12 @@ def handle_telnyx_webhook():
 
         elif event_type == "call.recording.saved" and leg == "recording":
             _save_recording(call_log_name, payload)
+
+        elif event_type == "call.recording.transcription.saved" and leg == "recording":
+            _save_transcript(call_log_name, payload)
+
+        elif event_type == "call.recording.error" and leg == "recording":
+            _handle_recording_error(call_log_name, payload)
     except Exception:
         frappe.log_error("Telnyx Webhook CRASH", frappe.get_traceback())
 
@@ -517,6 +531,11 @@ def _start_recording(call_control_id, call_log_name, agent_user=None):
                 "format": "mp3",
                 "channels": "dual",
                 "client_state": client_state,
+                # No transcription_language set deliberately - calls are in
+                # both English and Greek with no way to know which up front,
+                # so this needs an engine that auto-detects language.
+                "transcription": True,
+                "transcription_engine": TRANSCRIPTION_ENGINE,
             },
         )
     except Exception:
@@ -617,6 +636,51 @@ def _save_recording(call_log_name, payload):
     frappe.log_error(
         "Telnyx Recording Saved",
         f"call_log={call_log_name} FINAL recording_url={recording_url!r}",
+    )
+
+
+def _save_transcript(call_log_name, payload):
+    """call.recording.transcription.saved: store the full transcript, then
+    best-effort kick off an AI summary in the background. Enqueued rather
+    than called inline - an LLM call can take several seconds, and this
+    webhook needs to return quickly like every other handler here.
+    """
+    if not call_log_name:
+        frappe.log_error(
+            "Telnyx Webhook", f"call.recording.transcription.saved with no call_log in state: {payload}"
+        )
+        return
+
+    transcript = payload.get("transcription_text") or ""
+    frappe.db.set_value("CRM Call Log", call_log_name, "call_transcript", transcript)
+    frappe.db.commit()
+
+    # duration may not be set yet if this races ahead of call.hangup, but in
+    # practice transcription completes well after hangup - fetched fresh
+    # rather than trusted from an earlier point in this request.
+    duration = frappe.db.get_value("CRM Call Log", call_log_name, "duration")
+
+    from pbx_integration.ai_summary import should_summarize
+
+    if not should_summarize(transcript, duration):
+        return
+
+    frappe.enqueue(
+        "pbx_integration.ai_summary.generate_call_summary",
+        queue="short",
+        call_log_name=call_log_name,
+        transcript=transcript,
+    )
+
+
+def _handle_recording_error(call_log_name, payload):
+    """call.recording.error: covers failures anywhere in the record_start
+    pipeline, including transcription. Log-only - there's no recording or
+    transcript to fall back to, and the call itself has already ended.
+    """
+    frappe.log_error(
+        "Telnyx Recording/Transcription Error",
+        f"call_log={call_log_name} reason={payload.get('reason')!r} payload={payload}",
     )
 
 

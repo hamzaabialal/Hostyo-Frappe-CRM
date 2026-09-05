@@ -229,6 +229,8 @@ def get_call_log(name: str):
 			"reference_doctype",
 			"reference_docname",
 			"creation",
+			"call_transcript",
+			"ai_summary",
 		],
 	).as_dict()
 

@@ -152,6 +152,35 @@
             </div>
           </div>
         </div>
+        <div
+          v-if="callLog?.data?.call_transcript"
+          class="mt-1 rounded border"
+        >
+          <button
+            type="button"
+            class="flex w-full items-center justify-between px-3 py-2 text-base text-ink-gray-7"
+            @click="transcriptOpen = !transcriptOpen"
+          >
+            <span class="font-medium">{{ __('Transcript') }}</span>
+            <FeatherIcon
+              :name="transcriptOpen ? 'chevron-up' : 'chevron-down'"
+              class="h-4 w-4 text-ink-gray-5"
+            />
+          </button>
+          <FadedScrollableDiv
+            v-if="transcriptOpen"
+            class="max-h-64 overflow-y-auto whitespace-pre-wrap border-t px-3 py-2 text-base text-ink-gray-7"
+          >
+            {{ callLog.data.call_transcript }}
+          </FadedScrollableDiv>
+        </div>
+        <div
+          v-if="callLog?.data?.ai_summary"
+          class="mt-1 rounded border px-3 py-2 text-base text-ink-gray-7"
+        >
+          <div class="mb-1 font-medium">{{ __('AI Summary') }}</div>
+          <div>{{ callLog.data.ai_summary }}</div>
+        </div>
       </div>
       <div
         v-if="!callLog?.data?._lead && !callLog?.data?._deal"
@@ -206,6 +235,9 @@ const task = ref('')
 // (recording never made / expired) — track load failure to show a fallback instead
 // of a dead 0:00 player
 const recordingError = ref(false)
+
+// Transcript can be long — collapsed by default so it doesn't dominate the panel.
+const transcriptOpen = ref(false)
 
 function showNote(name) {
   showModal({
@@ -422,6 +454,7 @@ watch(
   (value) => {
     if (!value) return
     recordingError.value = false
+    transcriptOpen.value = false
     d.value = useDocument('CRM Call Log', value)
   },
 )
