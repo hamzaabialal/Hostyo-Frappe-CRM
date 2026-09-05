@@ -8,3 +8,4 @@ pbx_integration.patches.add_telnyx_did_field
 pbx_integration.patches.add_signwell_document_id_field
 pbx_integration.patches.add_contract_sent_on_field
 pbx_integration.patches.add_call_transcript_fields
+pbx_integration.patches.add_call_logs_default_sort_view

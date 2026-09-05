@@ -11,6 +11,14 @@ export const globalStore = defineStore('crm-global', () => {
   // lead's name right away, instead of waiting on the webhook/socket round-trip.
   const pendingCall = ref(null)
 
+  // Set by TelnyxCallUI.vue when its WebRTC client's `telnyx.ready` event
+  // fires. Outbound click-to-call dials the agent's own SIP identity via
+  // Telnyx Call Control - if that WebRTC session isn't registered yet
+  // (e.g. right after page load), Telnyx finds nothing to ring and the
+  // call fails silently within ~2s with no popup ever shown. Gating on
+  // this closes that race.
+  const telnyxReady = ref(false)
+
   function setMakeCall(value) {
     callMethod = value
   }
@@ -53,6 +61,13 @@ export const globalStore = defineStore('crm-global', () => {
       return
     }
 
+    // Safety net behind the disabled button on Deal/Lead - covers any
+    // other caller of makeCall() that doesn't check readiness itself.
+    if (!telnyxReady.value) {
+      toast.error('Softphone is still connecting - try again in a moment')
+      return
+    }
+
     const ref = reference || getCallReference()
 
     call('pbx_integration.telnyx.create_click2call', {
@@ -80,5 +95,6 @@ export const globalStore = defineStore('crm-global', () => {
     makeCall,
     setMakeCall,
     pendingCall,
+    telnyxReady,
   }
 })

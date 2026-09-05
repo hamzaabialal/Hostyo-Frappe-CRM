@@ -124,8 +124,9 @@
               <div class="flex gap-1.5">
                 <Button
                   v-if="callEnabled"
-                  :tooltip="__('Make a Call')"
+                  :tooltip="telnyxReady ? __('Make a Call') : __('Connecting to softphone...')"
                   :icon="PhoneIcon"
+                  :disabled="!telnyxReady"
                   @click="
                     () =>
                       doc.mobile_no
@@ -319,6 +320,7 @@ import {
 import { getView } from '@/utils/view'
 import { getSettings } from '@/stores/settings'
 import { globalStore } from '@/stores/global'
+import { storeToRefs } from 'pinia'
 import { statusesStore } from '@/stores/statuses'
 import { getMeta } from '@/stores/meta'
 import { useDocument } from '@/data/document'
@@ -347,7 +349,12 @@ import { useRouter, useRoute } from 'vue-router'
 import { useActiveTabManager } from '@/composables/useActiveTabManager'
 
 const { brand } = getSettings()
-const { $dialog, $socket, makeCall } = globalStore()
+const gStore = globalStore()
+const { $dialog, $socket, makeCall } = gStore
+// telnyxReady is a ref on the store - storeToRefs() is required to keep a
+// destructured property reactive (a plain destructure would snapshot its
+// current value once and never update as the WebRTC client connects).
+const { telnyxReady } = storeToRefs(gStore)
 const { statusOptions, getLeadStatus } = statusesStore()
 const { doctypeMeta } = getMeta('CRM Lead')
 

@@ -315,6 +315,13 @@ async function setupClient() {
 
   client.value.on('telnyx.ready', () => {
     console.log('Telnyx WebRTC client ready')
+    // Outbound click-to-call dials this same SIP identity - before this
+    // fires, Telnyx has no live registration to ring, so a call placed too
+    // early fails within ~2s with no popup ever shown (see global.js).
+    // Set via the store instance directly (not destructured) - Pinia only
+    // keeps a destructured property reactive via storeToRefs(), and this
+    // ref would otherwise be a disconnected snapshot.
+    gStore.telnyxReady = true
   })
 
   client.value.on('telnyx.error', (err) => {
@@ -521,6 +528,7 @@ onBeforeUnmount(() => {
   if (client.value) {
     client.value.disconnect()
   }
+  gStore.telnyxReady = false
   $socket.off('connect', onSocketConnect)
   $socket.off('disconnect', onSocketDisconnect)
   $socket.off('connect_error', onSocketConnectError)
