@@ -57,6 +57,39 @@ pbx_integration/overrides/personal_meet.py (the frappe_appointment fork
 with the first three fixes) is left in place, unused - not deleted, in case
 this rewrite ever needs to cross-check what upstream does for something not
 reimplemented here.
+
+Bug #4, found even after this rewrite (confirmed live, 2026-09-04): the
+same "Invalid attendee email" 400 still happened with a correctly-built
+event_participants list, because frappe_appointment's OWN
+EventOverride.before_insert() has:
+
+    elif self.custom_user_calendar:
+        self.user_calendar = frappe.get_doc(USER_APPOINTMENT_AVAILABILITY, self.custom_user_calendar)
+        ...
+        self.update_attendees_for_appointment_group()
+
+Setting custom_user_calendar on the Event doc (which this file originally
+did, to preserve metadata the old chain also set) triggers
+update_attendees_for_appointment_group(), which overwrites our correctly-
+built event_participants before insert - confirmed via a live isolated
+test: identical Event dicts insert successfully with correct attendee
+emails when custom_user_calendar/custom_appointment_slot_duration are
+omitted, and fail the exact same way when they're included.
+
+Fix: don't set custom_user_calendar or custom_appointment_slot_duration on
+the Event doc at all - not a patch to that before_insert branch (we don't
+control that file, same reasoning as every other bug in this chain), just
+not triggering it in the first place. Their only purpose was
+meeting-provider/Zoom/Meet-link setup (moot - this site's Meeting Provider
+is "None") and powering the reschedule_url property (unused - no reschedule
+UI exists anywhere in this CRM's frontend). Losing them costs nothing this
+app actually uses.
+
+The organizer self-link entry that used to be appended to
+custom_doctype_link_with_event is also gone as of this fix - it only ever
+existed to mirror upstream's own book_time_slot, was never read by
+get_meetings/MeetingArea.vue (both only care about the CRM Lead/Deal
+reference), and was dead weight independent of bug #4.
 """
 
 import json
@@ -145,20 +178,15 @@ def book_personal_meeting(
 			if EMAIL_RE.match(participant):
 				event_participants.append({"email": participant})
 
+	# No organizer self-link appended here (see module docstring, bug #4) -
+	# get_meetings/MeetingArea.vue only ever query/read "Event DocType Link"
+	# rows for the CRM Lead/Deal reference, never for "User Appointment
+	# Availability" - confirmed by grepping this whole frontend/backend for
+	# both terms. That self-link was already dead weight before bug #4 was
+	# even found (it's custom_user_calendar alone that triggers
+	# EventOverride.before_insert's buggy branch, not this field) - just no
+	# longer worth adding back now that we know it serves nothing here.
 	doctype_links = json.loads(custom_doctype_link_with_event) if custom_doctype_link_with_event else []
-	organizer_already_linked = any(
-		link.get("reference_doctype") == "User Appointment Availability"
-		and link.get("reference_docname") == user_availability.name
-		for link in doctype_links
-	)
-	if not organizer_already_linked:
-		doctype_links.append(
-			{
-				"reference_doctype": "User Appointment Availability",
-				"reference_docname": user_availability.name,
-				"value": user_availability.user,
-			}
-		)
 
 	duration_str = duration_to_string(duration.duration)
 	subject = f"Meet: {user_name} <> {organizer_full_name} ({duration_str})"
@@ -180,8 +208,6 @@ def book_personal_meeting(
 			"custom_doctype_link_with_event": doctype_links,
 			"send_reminder": 0,
 			"event_type": "Private",
-			"custom_user_calendar": user_availability.name,
-			"custom_appointment_slot_duration": duration.name,
 		}
 	)
 	event.insert(ignore_permissions=True)
