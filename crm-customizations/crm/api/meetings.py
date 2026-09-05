@@ -241,6 +241,21 @@ def book_meeting(
 
 	from pbx_integration.personal_meetings import book_personal_meeting
 
+	# TEMPORARY DEBUG LOGGING - remove once the reported booking time-shift
+	# bug is confirmed fixed or root-caused. frappe.log_error proved
+	# unreliable for tracing this specific bug this session (writes to the
+	# DB-backed Error Log doctype, which is why); using frappe.logger's own
+	# file-backed logger instead - writes real lines to
+	# sites/<site>/logs/meeting_debug.log regardless of what else happens in
+	# this request, tail-able directly. "[MEETING_DEBUG]" prefix on every
+	# line keeps them greppable among anything else that log file might ever
+	# contain.
+	debug_logger = frappe.logger("meeting_debug", allow_site=True)
+	debug_logger.info(
+		f"[MEETING_DEBUG] raw input date={date!r} start_time={start_time!r} "
+		f"end_time={end_time!r} user_timezone_offset={user_timezone_offset!r}"
+	)
+
 	custom_doctype_link_with_event = json.dumps(
 		[
 			{
@@ -251,11 +266,17 @@ def book_meeting(
 		]
 	)
 
+	utc_start_time = _local_to_utc_iso(date, start_time, user_timezone_offset)
+	utc_end_time = _local_to_utc_iso(date, end_time, user_timezone_offset)
+	debug_logger.info(
+		f"[MEETING_DEBUG] _local_to_utc_iso output start_time={utc_start_time!r} end_time={utc_end_time!r}"
+	)
+
 	response = book_personal_meeting(
 		duration_id=duration_id,
 		date=date,
-		start_time=_local_to_utc_iso(date, start_time, user_timezone_offset),
-		end_time=_local_to_utc_iso(date, end_time, user_timezone_offset),
+		start_time=utc_start_time,
+		end_time=utc_end_time,
 		user_timezone_offset=user_timezone_offset,
 		user_name=user_name,
 		user_email=user_email,
@@ -273,12 +294,21 @@ def book_meeting(
 	# exists, via the same frappe.db.set_value pattern used throughout
 	# pbx_integration/telnyx.py - a mechanism already proven to work in this
 	# codebase, not an assumption.
-	if meeting_type:
-		body = response[0] if isinstance(response, (list, tuple)) else response
-		event_id = (body or {}).get("event_id")
-		if event_id:
-			frappe.db.set_value("Event", event_id, "meeting_type", meeting_type)
-			frappe.db.commit()
+	body = response[0] if isinstance(response, (list, tuple)) else response
+	event_id = (body or {}).get("event_id")
+
+	# TEMPORARY DEBUG LOGGING - see note above.
+	if event_id:
+		stored_starts_on, stored_ends_on = frappe.db.get_value("Event", event_id, ["starts_on", "ends_on"])
+		debug_logger.info(
+			f"[MEETING_DEBUG] Event {event_id} stored starts_on={stored_starts_on!r} ends_on={stored_ends_on!r}"
+		)
+	else:
+		debug_logger.info(f"[MEETING_DEBUG] no event_id in response: {response!r}")
+
+	if meeting_type and event_id:
+		frappe.db.set_value("Event", event_id, "meeting_type", meeting_type)
+		frappe.db.commit()
 
 	# book_time_slot can return a plain dict (success, or some error paths)
 	# or a (dict, status_code) tuple (confirmed for at least the "no user
@@ -289,7 +319,12 @@ def book_meeting(
 
 
 @frappe.whitelist()
-def get_meetings(reference_doctype: str = None, reference_name: str = None):
+def get_meetings(
+	reference_doctype: str = None,
+	reference_name: str = None,
+	start: int = 0,
+	page_length: int = None,
+):
 	"""List meetings (Events) linked to a CRM Lead/Deal via frappe_appointment's
 	"Event DocType Link" child table, following the same
 	child-table-join shape crm.api.activities.get_linked_calls uses for
@@ -315,6 +350,17 @@ def get_meetings(reference_doctype: str = None, reference_name: str = None):
 	flexible endpoint lets the new global page reuse those same components
 	with a parameter change rather than needing a second endpoint name wired
 	through them too.
+
+	start/page_length: pagination for MeetingsListView.vue, matching this
+	CRM's own Leads/Deals list convention - a 20-row page fetched via
+	"Load More" rather than numbered pages (confirmed against frappe/crm's
+	own Leads.vue: updatedPageCount defaults to 20, loaded incrementally,
+	not paged numerically). page_length defaults to None (no LIMIT at all,
+	today's original behavior) rather than defaulting to 20 outright -
+	MeetingsCalendarView.vue calls this same endpoint and needs every
+	meeting in view to render the calendar grid and legend correctly, not
+	just the first page; only MeetingsListView.vue actually passes these
+	two params.
 	"""
 	# "Event DocType Link" only exists as a table once frappe_appointment is
 	# installed - it's that app's own doctype, not core Frappe's. Unlike
@@ -376,6 +422,8 @@ def get_meetings(reference_doctype: str = None, reference_name: str = None):
 		.where(EventLink.parenttype == "Event")
 		.orderby(Event.starts_on, order=Order.desc)
 	)
+	if page_length is not None:
+		query = query.limit(page_length).offset(start)
 	if reference_doctype and reference_name:
 		query = query.where(EventLink.reference_doctype == reference_doctype).where(
 			EventLink.reference_docname == reference_name
